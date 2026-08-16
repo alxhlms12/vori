@@ -1,0 +1,15 @@
+{
+  "category:modules": [ 
+	{
+      "id": "vori",
+      "name": "vori",
+      "download": "vori.js",
+      "version": "v1.5.0",
+      "type": "MODULE",
+      "author": "alxhlms",
+      "description": "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
+      "featured": true,
+      "trusted": true
+    }
+  ]
+}
