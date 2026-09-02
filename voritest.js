@@ -1,132 +1,23 @@
-/* VORI 1.6.0
- * Fast + compatibility-first 8SPINE resolver
- */
-
 var SEARCH_ENDPOINT = "https://search.alxhlms.workers.dev";
 var PLAYBACK_ENDPOINT = "https://playback.alxhlms.workers.dev";
 
 var MAX_SEARCH_CACHE = 100;
-var MAX_TRACK_CACHE = 2000;
-var MAX_STREAM_CACHE = 2000;
-
-var SEARCH_TTL = 5 * 60 * 1000;
-var STREAM_TTL = 60 * 60 * 1000;
+var MAX_TRACK_CACHE = 1000;
 
 var searchCache = new Map();
 var pendingSearches = new Map();
-var trackMap = new Map();
-var streamCache = new Map();
+var trackCache = new Map();
 
-/* ---------------------------------------------------------
- * Connection warmup
- * --------------------------------------------------------- */
-
-(function prewarmConnections() {
-  try {
-    fetch(SEARCH_ENDPOINT + "/ping", {
-      method: "HEAD",
-      mode: "no-cors"
-    }).catch(function () {});
-
-    fetch(PLAYBACK_ENDPOINT + "/ping", {
-      method: "HEAD",
-      mode: "no-cors"
-    }).catch(function () {});
-  } catch (e) {}
-})();
-
-/* ---------------------------------------------------------
- * Quality
- * --------------------------------------------------------- */
-
-var QUAL_MAP = {
-  LOSSLESS: "LOSSLESS",
-  FLAC: "LOSSLESS",
-  CD: "LOSSLESS",
-  "16BIT": "LOSSLESS",
-
-  HIGH: "HIGH",
-  AAC: "HIGH",
-  AACLC: "HIGH",
-  AAC320: "HIGH",
-  "320": "HIGH"
-};
-
-function normalizeQuality(input) {
-  if (!input) return "LOSSLESS";
-
-  var s = String(input).toUpperCase();
-
-  if (QUAL_MAP[s]) {
-    return QUAL_MAP[s];
-  }
-
-  if (
-    s.indexOf("AAC") !== -1 ||
-    s.indexOf("320") !== -1 ||
-    s.indexOf("HIGH") !== -1
-  ) {
-    return "HIGH";
-  }
-
-  return "LOSSLESS";
-}
-
-function qualityToPlaybackParam(input) {
-  return normalizeQuality(input) === "HIGH"
-    ? "high"
-    : "flac";
-}
-
-function qualityLabel(input) {
-  return normalizeQuality(input) === "HIGH"
-    ? "AAC 320kbps"
-    : "LOSSLESS 16-bit / 44.1 kHz";
-}
-
-function formatActualQualityLabel(streamInfo) {
-  var q = normalizeQuality(
-    streamInfo && (
-      streamInfo.quality ||
-      streamInfo.audioQuality
-    )
-  );
-
-  var bits = Number(
-    streamInfo && (
-      streamInfo.bitDepth ||
-      streamInfo.bit_depth
-    )
-  );
-
-  var rate = Number(
-    streamInfo && (
-      streamInfo.sampleRate ||
-      streamInfo.sample_rate ||
-      streamInfo.samplingRate ||
-      streamInfo.sampling_rate
-    )
-  );
-
-  if (q === "LOSSLESS" && bits > 0 && rate > 0) {
-    return (
-      "LOSSLESS " +
-      bits +
-      "-bit / " +
-      rate +
-      " kHz"
-    );
-  }
-
-  return qualityLabel(q);
-}
-
-/* ---------------------------------------------------------
+/* -------------------------------------------------------
  * Cache
- * --------------------------------------------------------- */
+ * ----------------------------------------------------- */
 
-function setBoundedCache(map, key, value, maxEntries) {
-  if (!map.has(key) && map.size >= maxEntries) {
+function cacheSet(map, key, value, max) {
+  if (map.has(key)) {
+    map.delete(key);
+  }
+
+  while (map.size >= max) {
     map.delete(map.keys().next().value);
   }
 
@@ -134,378 +25,238 @@ function setBoundedCache(map, key, value, maxEntries) {
   return value;
 }
 
-function getCache(map, key, ttl) {
-  var entry = map.get(key);
+/* -------------------------------------------------------
+ * Quality
+ *
+ * Playback Worker automatically selects the best quality.
+ * The quality setting is therefore only metadata for 8SPINE.
+ * ----------------------------------------------------- */
 
-  if (!entry) {
-    return null;
+var QUALITY_MAP = {
+  LOSSLESS: "LOSSLESS",
+  FLAC: "LOSSLESS",
+  CD: "LOSSLESS",
+  "16BIT": "LOSSLESS",
+  HIGH: "HIGH",
+  AACLC: "HIGH",
+  AAC320: "HIGH",
+  "320": "HIGH"
+};
+
+function normalizeQuality(value) {
+  if (!value) return "LOSSLESS";
+
+  var q = String(value).toUpperCase();
+
+  if (QUALITY_MAP[q]) {
+    return QUALITY_MAP[q];
   }
 
-  if (
-    ttl !== Infinity &&
-    Date.now() - entry.time > ttl
-  ) {
-    map.delete(key);
-    return null;
+  if (q.indexOf("320") !== -1 || q.indexOf("HIGH") !== -1) {
+    return "HIGH";
   }
 
-  return entry.value;
+  return "LOSSLESS";
 }
 
-function putCache(map, key, value, maxEntries) {
-  return setBoundedCache(
-    map,
-    key,
-    {
-      value: value,
-      time: Date.now()
-    },
-    maxEntries
-  );
+function qualityLabel(value) {
+  return normalizeQuality(value) === "HIGH"
+    ? "AAC 320kbps"
+    : "LOSSLESS 16-bit / 44.1 kHz";
 }
 
-/* ---------------------------------------------------------
- * Search response handling
- * --------------------------------------------------------- */
+/* -------------------------------------------------------
+ * Response Helpers
+ * ----------------------------------------------------- */
 
-function extractItems(res) {
-  if (!res) return [];
+function extractTracks(response) {
+  if (!response) return [];
 
-  if (Array.isArray(res)) {
-    return res;
+  if (Array.isArray(response)) {
+    return response;
   }
 
-  if (Array.isArray(res.tracks)) {
-    return res.tracks;
+  if (Array.isArray(response.tracks)) {
+    return response.tracks;
   }
 
-  if (res.data) {
-    if (Array.isArray(res.data.tracks)) {
-      return res.data.tracks;
+  if (Array.isArray(response.results)) {
+    return response.results;
+  }
+
+  if (Array.isArray(response.items)) {
+    return response.items;
+  }
+
+  if (Array.isArray(response.data)) {
+    return response.data;
+  }
+
+  if (response.data) {
+    if (Array.isArray(response.data.tracks)) {
+      return response.data.tracks;
     }
 
-    if (Array.isArray(res.data.items)) {
-      return res.data.items;
+    if (Array.isArray(response.data.items)) {
+      return response.data.items;
     }
 
-    if (Array.isArray(res.data)) {
-      return res.data;
+    if (Array.isArray(response.data.results)) {
+      return response.data.results;
     }
-  }
-
-  if (Array.isArray(res.items)) {
-    return res.items;
-  }
-
-  if (Array.isArray(res.results)) {
-    return res.results;
   }
 
   return [];
 }
 
-/* ---------------------------------------------------------
- * Safe property helpers
- * --------------------------------------------------------- */
+function getQuality(item) {
+  if (!item) return "LOSSLESS";
 
-function firstString() {
-  for (var i = 0; i < arguments.length; i++) {
-    var v = arguments[i];
+  var value =
+    item.audioQuality ||
+    item.quality ||
+    item.qualityLabel ||
+    item.format ||
+    item.audioFormat ||
+    item.formatLabel;
 
-    if (
-      typeof v === "string" &&
-      v.trim()
-    ) {
-      return v.trim();
-    }
-
-    if (
-      typeof v === "number" &&
-      isFinite(v)
-    ) {
-      return String(v);
-    }
+  if (!value && item.attributes) {
+    value =
+      item.attributes.audioQuality ||
+      item.attributes.quality ||
+      item.attributes.format ||
+      item.attributes.audioFormat;
   }
 
-  return "";
+  return normalizeQuality(value);
 }
 
-function getNestedString(obj, paths) {
-  for (var i = 0; i < paths.length; i++) {
-    var current = obj;
+/* -------------------------------------------------------
+ * Track Normalization
+ * ----------------------------------------------------- */
 
-    for (var j = 0; j < paths[i].length; j++) {
-      if (
-        current == null ||
-        typeof current !== "object"
-      ) {
-        current = null;
-        break;
+function normalizeTrack(item, fallbackQuality) {
+  item = item || {};
+
+  var isrc = String(
+    item.isrc ||
+    item.ISRC ||
+    ""
+  ).trim();
+
+  var id = isrc || String(
+    item.id ||
+    item.trackId ||
+    ""
+  ).trim();
+
+  var artist = "Unknown Artist";
+
+  if (typeof item.artist === "string") {
+    artist = item.artist;
+  } else if (item.artist && item.artist.name) {
+    artist = item.artist.name;
+  } else if (item.artistName) {
+    artist = item.artistName;
+  } else if (Array.isArray(item.artists)) {
+    var artistNames = [];
+
+    for (var i = 0; i < item.artists.length; i++) {
+      var artistItem = item.artists[i];
+
+      if (typeof artistItem === "string") {
+        artistNames.push(artistItem);
+      } else if (artistItem && artistItem.name) {
+        artistNames.push(artistItem.name);
       }
-
-      current = current[paths[i][j]];
     }
 
-    if (
-      typeof current === "string" &&
-      current.trim()
-    ) {
-      return current.trim();
-    }
-
-    if (
-      typeof current === "number" &&
-      isFinite(current)
-    ) {
-      return String(current);
+    if (artistNames.length) {
+      artist = artistNames.join(", ");
     }
   }
 
-  return "";
-}
+  var album = "";
 
-/* ---------------------------------------------------------
- * Quality extraction
- * --------------------------------------------------------- */
-
-function extractTrackQuality(rawItem) {
-  if (!rawItem || typeof rawItem !== "object") {
-    return "LOSSLESS";
+  if (typeof item.album === "string") {
+    album = item.album;
+  } else if (item.album && item.album.title) {
+    album = item.album.title;
+  } else if (item.albumName) {
+    album = item.albumName;
   }
 
-  var q =
-    rawItem.audioQuality ||
-    rawItem.quality ||
-    rawItem.qualityLabel ||
-    rawItem.format ||
-    rawItem.audioFormat ||
-    rawItem.formatLabel;
+  var cover =
+    item.albumCover ||
+    item.cover ||
+    null;
 
-  if (!q && rawItem.attributes) {
-    q =
-      rawItem.attributes.audioQuality ||
-      rawItem.attributes.quality ||
-      rawItem.attributes.format ||
-      rawItem.attributes.audioFormat;
+  if (!cover && item.album) {
+    cover =
+      item.album.cover_xl ||
+      item.album.cover_big ||
+      item.album.cover_medium ||
+      item.album.cover ||
+      null;
   }
 
-  return q
-    ? normalizeQuality(q)
-    : "LOSSLESS";
-}
-
-/* ---------------------------------------------------------
- * Track normalization
- *
- * IMPORTANT:
- * We DO NOT replace the provider's object shape.
- * We clone it and preserve all original properties.
- * --------------------------------------------------------- */
-
-function transformTrackPayload(rawItem, fallbackQuality) {
-  if (
-    !rawItem ||
-    typeof rawItem !== "object"
-  ) {
-    return null;
-  }
-
-  /*
-   * Preserve the original search result.
-   *
-   * This is the important part that my previous version
-   * screwed up.
-   */
-  var track = Object.assign({}, rawItem);
-
-  var title = firstString(
-    rawItem.title,
-    rawItem.name
-  );
-
-  var artist = firstString(
-    rawItem.artistName,
-    rawItem.artist_name,
-    typeof rawItem.artist === "string"
-      ? rawItem.artist
-      : ""
-  );
-
-  if (!artist) {
-    artist = getNestedString(
-      rawItem,
-      [
-        ["artist", "name"],
-        ["artists", "0", "name"],
-        ["artists", "0", "artistName"],
-        ["artist", "artistName"]
-      ]
-    );
-  }
-
-  var album = firstString(
-    rawItem.albumName,
-    rawItem.album_name,
-    typeof rawItem.album === "string"
-      ? rawItem.album
-      : ""
-  );
-
-  if (!album) {
-    album = getNestedString(
-      rawItem,
-      [
-        ["album", "title"],
-        ["album", "name"],
-        ["album", "albumName"]
-      ]
-    );
-  }
-
-  var isrc = firstString(
-    rawItem.isrc,
-    rawItem.ISRC,
-    rawItem.external_id
-  );
-
-  var id = firstString(
-    rawItem.id,
-    rawItem.trackId,
-    rawItem.track_id,
-    rawItem.id
-  );
-
-  /*
-   * Only fill missing simple fields.
-   *
-   * If the provider already supplied an object for artist/album,
-   * DON'T overwrite it with a string.
-   */
-
-  if (
-    track.title == null &&
-    title
-  ) {
-    track.title = title;
-  }
-
-  if (
-    track.isrc == null &&
-    isrc
-  ) {
-    track.isrc = isrc;
-  }
-
-  if (
-    track.id == null &&
-    id
-  ) {
-    track.id = id;
-  }
-
-  /*
-   * Do NOT do:
-   *
-   * track.artist = artist
-   *
-   * because the provider might have:
-   *
-   * artist: { name: "..." }
-   *
-   * and 8SPINE may expect that object.
-   */
-
-  if (
-    track.artistName == null &&
-    artist
-  ) {
-    track.artistName = artist;
-  }
-
-  if (
-    track.albumName == null &&
-    album
-  ) {
-    track.albumName = album;
-  }
-
-  var quality = extractTrackQuality(
-    rawItem
-  );
+  var quality = getQuality(item);
 
   if (!quality) {
-    quality = normalizeQuality(
-      fallbackQuality
-    );
+    quality = normalizeQuality(fallbackQuality);
   }
 
-  var bitDepth = Number(
-    rawItem.bitDepth ||
-    rawItem.bit_depth ||
-    rawItem.maximumBitDepth ||
-    rawItem.maximum_bit_depth ||
+  var bits = Number(
+    item.bitDepth ||
+    (item.audioInfo && item.audioInfo.bitDepth) ||
+    (item.attributes && item.attributes.bitDepth) ||
     0
   );
 
   var sampleRate = Number(
-    rawItem.sampleRate ||
-    rawItem.sample_rate ||
-    rawItem.samplingRate ||
-    rawItem.sampling_rate ||
-    rawItem.maximumSamplingRate ||
-    rawItem.maximum_sampling_rate ||
+    item.sampleRate ||
+    (item.audioInfo && item.audioInfo.sampleRate) ||
+    (item.attributes && item.attributes.sampleRate) ||
     0
   );
 
-  /*
-   * Again: only add these if they aren't already there.
-   */
-
-  if (
-    track.quality == null
-  ) {
-    track.quality = quality;
+  if (sampleRate >= 1000) {
+    sampleRate /= 1000;
   }
 
-  if (
-    track.bitDepth == null &&
-    bitDepth > 0
-  ) {
-    track.bitDepth = bitDepth;
+  var track = {
+    id: id,
+    isrc: isrc || null,
+    title:
+      item.title ||
+      item.name ||
+      item.trackName ||
+      item.title_short ||
+      "Unknown Track",
+    artist: artist,
+    album: album,
+    albumCover: cover,
+    duration: Number(item.duration) || 0,
+    trackNumber:
+      item.trackNumber ||
+      item.track_number ||
+      1,
+    audioQuality: qualityLabel(quality),
+    quality: quality
+  };
+
+  if (bits > 0) {
+    track.bitDepth = bits;
   }
 
-  if (
-    track.sampleRate == null &&
-    sampleRate > 0
-  ) {
+  if (sampleRate > 0) {
     track.sampleRate = sampleRate;
   }
 
-  /*
-   * Cache the complete provider-compatible object.
-   */
-
-  var cacheId = firstString(
-    rawItem.id,
-    rawItem.trackId,
-    rawItem.track_id,
-    rawItem.isrc,
-    rawItem.ISRC
-  );
-
-  if (cacheId) {
-    setBoundedCache(
-      trackMap,
-      cacheId,
-      track,
-      MAX_TRACK_CACHE
-    );
-  }
-
-  if (isrc) {
-    setBoundedCache(
-      trackMap,
-      isrc.toLowerCase(),
+  if (id) {
+    cacheSet(
+      trackCache,
+      id,
       track,
       MAX_TRACK_CACHE
     );
@@ -514,22 +265,13 @@ function transformTrackPayload(rawItem, fallbackQuality) {
   return track;
 }
 
-/* ---------------------------------------------------------
+/* -------------------------------------------------------
  * Search
- * --------------------------------------------------------- */
+ * ----------------------------------------------------- */
 
-async function searchTracks(
-  query,
-  limit,
-  context
-) {
+async function searchTracks(query, limit, context) {
+  query = String(query || "").trim();
   limit = Number(limit) || 15;
-
-  query = String(
-    query || ""
-  )
-    .replace(/\s+/g, " ")
-    .trim();
 
   if (!query) {
     return {
@@ -538,53 +280,43 @@ async function searchTracks(
     };
   }
 
-  /*
-   * Quality does NOT belong in the search cache key.
-   *
-   * Search results are metadata.
-   * Playback quality is resolved later.
-   */
+  var requestedQuality =
+    context &&
+    context.settings &&
+    context.settings.audioQuality &&
+    context.settings.audioQuality.value;
+
+  requestedQuality = normalizeQuality(
+    requestedQuality || "LOSSLESS"
+  );
 
   var cacheKey =
     query.toLowerCase() +
     "|" +
-    limit;
+    limit +
+    "|" +
+    requestedQuality;
 
-  var cached = getCache(
-    searchCache,
-    cacheKey,
-    SEARCH_TTL
-  );
+  var cached = searchCache.get(cacheKey);
 
   if (cached) {
     return cached;
   }
 
-  /*
-   * Prevent duplicate searches when the UI fires the same
-   * request multiple times.
-   */
-
-  var pending =
-    pendingSearches.get(cacheKey);
+  var pending = pendingSearches.get(cacheKey);
 
   if (pending) {
     return pending;
   }
 
-  var requestUrl =
+  var url =
     SEARCH_ENDPOINT +
     "/search?q=" +
     encodeURIComponent(query);
 
-  var promise = (async function () {
+  var request = (async function() {
     try {
-      var response = await fetch(
-        requestUrl,
-        {
-          method: "GET"
-        }
-      );
+      var response = await fetch(url);
 
       if (!response.ok) {
         throw new Error(
@@ -593,30 +325,21 @@ async function searchTracks(
         );
       }
 
-      var body =
-        await response.json();
-
-      var rawTracks =
-        extractItems(body);
+      var json = await response.json();
+      var rawTracks = extractTracks(json);
 
       var count = Math.min(
         rawTracks.length,
         limit
       );
 
-      var tracks =
-        new Array(count);
+      var tracks = new Array(count);
 
-      for (
-        var i = 0;
-        i < count;
-        i++
-      ) {
-        tracks[i] =
-          transformTrackPayload(
-            rawTracks[i],
-            "LOSSLESS"
-          );
+      for (var i = 0; i < count; i++) {
+        tracks[i] = normalizeTrack(
+          rawTracks[i],
+          requestedQuality
+        );
       }
 
       var result = {
@@ -624,7 +347,7 @@ async function searchTracks(
         total: count
       };
 
-      putCache(
+      cacheSet(
         searchCache,
         cacheKey,
         result,
@@ -633,187 +356,87 @@ async function searchTracks(
 
       return result;
     } finally {
-      pendingSearches.delete(
-        cacheKey
-      );
+      pendingSearches.delete(cacheKey);
     }
   })();
 
   pendingSearches.set(
     cacheKey,
-    promise
+    request
   );
 
-  return promise;
+  return request;
 }
 
-/* ---------------------------------------------------------
- * Playback URL
- * --------------------------------------------------------- */
-
-function getTrackStreamUrl(
-  trackId,
-  preferredQuality,
-  context
-) {
-  if (
-    trackId === null ||
-    trackId === undefined ||
-    String(trackId).trim() === ""
-  ) {
-    throw new Error(
-      "Valid track ID required for stream resolution"
-    );
-  }
-
-  var quality =
-    normalizeQuality(
-      preferredQuality ||
-      (
-        context &&
-        context.settings &&
-        context.settings.audioQuality &&
-        context.settings.audioQuality.value
-      ) ||
-      "LOSSLESS"
-    );
-
-  var id =
-    String(trackId).trim();
-
-  var qualityParam =
-    qualityToPlaybackParam(
-      quality
-    );
-
-  var cacheKey =
-    id +
-    "|" +
-    qualityParam;
-
-  var cached = getCache(
-    streamCache,
-    cacheKey,
-    STREAM_TTL
-  );
-
-  if (cached) {
-    return cached;
-  }
-
-  /*
-   * IMPORTANT:
-   *
-   * Your current playback Worker/frontend contract uses:
-   *
-   *     /stream?i=...&quality=...
-   *
-   * Keep that intact.
-   */
-
-  var url =
-    PLAYBACK_ENDPOINT +
-    "/stream?i=" +
-    encodeURIComponent(id) +
-    "&quality=" +
-    encodeURIComponent(
-      qualityParam
-    );
-
-  var result = {
-    streamUrl: url
-  };
-
-  putCache(
-    streamCache,
-    cacheKey,
-    result,
-    MAX_STREAM_CACHE
-  );
-
-  return result;
-}
-
-/* ---------------------------------------------------------
- * Optional prefetch
+/* -------------------------------------------------------
+ * Playback
  *
- * This ONLY warms the playback endpoint. It does not alter
- * the normal playback result.
- * --------------------------------------------------------- */
+ * IMPORTANT:
+ * The playback Worker accepts ONLY:
+ *
+ * /stream?i={ISRC}
+ *
+ * It automatically selects the best available quality.
+ *
+ * Do not fetch the Worker here.
+ * Do not append a quality parameter.
+ * ----------------------------------------------------- */
 
-function prefetchTrackStreamUrl(
-  trackId,
-  preferredQuality,
-  context
-) {
-  var result =
-    getTrackStreamUrl(
-      trackId,
-      preferredQuality,
-      context
-    );
+function getTrackStreamUrl(trackId, quality, context) {
+  var isrc = String(trackId || "").trim();
 
-  /*
-   * Don't consume the response body.
-   * Just initiate the request so the connection/resolver can
-   * warm up before the user presses play.
-   */
+  if (!isrc) {
+    throw new Error("Valid ISRC required for playback");
+  }
 
-  try {
-    fetch(result.streamUrl, {
-      method: "GET"
-    }).catch(function () {});
-  } catch (e) {}
+  var cachedTrack = trackCache.get(isrc);
 
-  return result;
+  return {
+    streamUrl:
+      PLAYBACK_ENDPOINT +
+      "/stream?i=" +
+      encodeURIComponent(isrc),
+
+    track: cachedTrack || {
+      id: isrc,
+      isrc: isrc,
+      audioQuality: qualityLabel(quality),
+      quality: normalizeQuality(quality)
+    }
+  };
 }
 
-/* ---------------------------------------------------------
+/* -------------------------------------------------------
  * Module
- * --------------------------------------------------------- */
+ * ----------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.1.0",
-
+  version: "1.2.1",
   description:
-    "if yuo are seeing this can i get a hug please",
+    "@._.alx.",
 
   settings: {
     audioQuality: {
       type: "selector",
-
-      label:
-        "Streaming Audio Quality",
-
-      description:
-        "Preferred audio target quality",
-
+      label: "Streaming Audio Quality",
+      description: "Preferred audio target quality",
       options: [
         {
-          label:
-            "Lossless (FLAC 16-bit / 44.1 kHz)",
+          label: "Lossless (FLAC 16-bit / 44.1 kHz)",
           value: "LOSSLESS"
         },
         {
-          label:
-            "High Quality (AAC 320kbps)",
+          label: "High Quality (AAC 320kbps)",
           value: "HIGH"
         }
       ],
-
       defaultValue: "LOSSLESS"
     }
   },
 
-  searchTracks:
-    searchTracks,
-
-  getTrackStreamUrl:
-    getTrackStreamUrl,
-
-  prefetchTrackStreamUrl:
-    prefetchTrackStreamUrl
+  searchTracks: searchTracks,
+  getTrackStreamUrl: getTrackStreamUrl
 };
