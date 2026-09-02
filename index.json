@@ -1,6 +1,6 @@
 {
-  "category:modules": [ 
-	  {
+  "category:modules": [
+    {
       "id": "vori",
       "name": "vori",
       "download": "vori.js",
@@ -8,11 +8,10 @@
       "type": "MODULE",
       "author": "alxhlms",
       "description": "uh vori ahh",
-      "tags": ["HI-RES", "DOBLY ATMOS", "TIDAL", "APPLE MUSIC"],
+      "tags": ["HI-RES", "QOBUZ"],
       "featured": true,
       "trusted": true
     },
-
     {
       "id": "vori-test",
       "name": "vori-test",
@@ -21,7 +20,13 @@
       "type": "MODULE",
       "author": "alxhlms",
       "description": "test for vori obviously",
-      "tags": ["HI-RES", "DOBLY ATMOS", "QOBUZ"],
+      "tags": ["HI-RES", "QOBUZ"],
       "featured": true,
       "trusted": true
     }
+  ],
+
+  "category:whatever": [
+    ...
+  ]
+}
