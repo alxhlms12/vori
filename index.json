@@ -3,11 +3,11 @@
     {
       "id": "vori",
       "name": "vori",
-      "download": "vori.js",
+      "download": "https://raw.githubusercontent.com/alxhlms12/vori/refs/heads/main/vori.js",
       "version": "v1.5.0",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "uh vori ahh",
+      "description": "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
       "tags": ["HI-RES", "QOBUZ"],
       "featured": true,
       "trusted": true
@@ -15,7 +15,7 @@
     {
       "id": "vori-test",
       "name": "vori-test",
-      "download": "voritest.js",
+      "download": "https://raw.githubusercontent.com/alxhlms12/vori/refs/heads/main/voritest.js",
       "version": "v1.0.0",
       "type": "MODULE",
       "author": "alxhlms",
