@@ -691,7 +691,7 @@ return {
   version: "1.0.0",
 
   description:
-    "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
+    "if yuo are seeing this can i get a hug please",
 
   settings: {
     audioQuality: {
