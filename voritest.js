@@ -685,10 +685,10 @@ function prefetchTrackStreamUrl(
  */
 
 return {
-  id: "vori",
-  name: "vori",
+  id: "vori-test",
+  name: "vori-test",
   author: "alxhlms",
-  version: "1.6.0",
+  version: "1.0.0",
 
   description:
     "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
