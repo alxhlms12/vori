@@ -24,9 +24,5 @@
       "featured": true,
       "trusted": true
     }
-  ],
-
-  "category:whatever": [
-    ...
   ]
 }
