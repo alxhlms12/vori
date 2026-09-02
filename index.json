@@ -7,7 +7,23 @@
       "version": "v1.5.0",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
+      "description": "Didy blud module 4 Qobuz :skull:",
+      "featured": true,
+      "trusted": true
+    }
+  ]
+}
+
+{
+  "category:modules": [ 
+	{
+      "id": "vori-test",
+      "name": "vori-test",
+      "download": "voritest.js",
+      "version": "v1.0.0",
+      "type": "MODULE",
+      "author": "alxhlms",
+      "description": "Official test branch, this branch may be unstable.",
       "featured": true,
       "trusted": true
     }
