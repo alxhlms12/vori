@@ -1,3 +1,5 @@
+/* HIIIIIIIIIIIIIIIIIIIIIIIII
+*/
 var SEARCH_ENDPOINT = "https://search.alxhlms.workers.dev";
 var PLAYBACK_ENDPOINT = "https://playback.alxhlms.workers.dev";
 
