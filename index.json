@@ -1,6 +1,6 @@
 {
-  "category:modules": [ 
-	{
+  "category:modules": [
+    {
       "id": "vori",
       "name": "vori",
       "download": "vori.js",
@@ -10,13 +10,8 @@
       "description": "Didy blud module 4 Qobuz :skull:",
       "featured": true,
       "trusted": true
-    }
-  ]
-}
-
-{
-  "category:modules": [ 
-	{
+    },
+    {
       "id": "vori-test",
       "name": "vori-test",
       "download": "voritest.js",
