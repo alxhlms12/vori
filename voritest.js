@@ -1,5 +1,7 @@
-/* HIIIIIIIIIIIIIIIIIIIIIIIII
-*/
+/* VORI 1.6.0
+ * Fast + compatibility-first 8SPINE resolver
+ */
+
 var SEARCH_ENDPOINT = "https://search.alxhlms.workers.dev";
 var PLAYBACK_ENDPOINT = "https://playback.alxhlms.workers.dev";
 
@@ -15,37 +17,27 @@ var pendingSearches = new Map();
 var trackMap = new Map();
 var streamCache = new Map();
 
-/*
- * ---------------------------------------------------------
+/* ---------------------------------------------------------
  * Connection warmup
- * ---------------------------------------------------------
- *
- * Do this immediately, but don't make it part of any critical
- * request. The goal is simply to get DNS/TLS/connection setup
- * out of the way before the user actually presses play.
- */
+ * --------------------------------------------------------- */
 
 (function prewarmConnections() {
   try {
     fetch(SEARCH_ENDPOINT + "/ping", {
       method: "HEAD",
-      mode: "no-cors",
-      cache: "no-store"
+      mode: "no-cors"
     }).catch(function () {});
 
     fetch(PLAYBACK_ENDPOINT + "/ping", {
       method: "HEAD",
-      mode: "no-cors",
-      cache: "no-store"
+      mode: "no-cors"
     }).catch(function () {});
   } catch (e) {}
 })();
 
-/*
- * ---------------------------------------------------------
- * Quality helpers
- * ---------------------------------------------------------
- */
+/* ---------------------------------------------------------
+ * Quality
+ * --------------------------------------------------------- */
 
 var QUAL_MAP = {
   LOSSLESS: "LOSSLESS",
@@ -54,6 +46,7 @@ var QUAL_MAP = {
   "16BIT": "LOSSLESS",
 
   HIGH: "HIGH",
+  AAC: "HIGH",
   AACLC: "HIGH",
   AAC320: "HIGH",
   "320": "HIGH"
@@ -69,9 +62,9 @@ function normalizeQuality(input) {
   }
 
   if (
-    s.indexOf("HIGH") !== -1 ||
+    s.indexOf("AAC") !== -1 ||
     s.indexOf("320") !== -1 ||
-    s.indexOf("AAC") !== -1
+    s.indexOf("HIGH") !== -1
   ) {
     return "HIGH";
   }
@@ -79,29 +72,40 @@ function normalizeQuality(input) {
   return "LOSSLESS";
 }
 
-function qualityToPlaybackParam(quality) {
-  return normalizeQuality(quality) === "HIGH"
+function qualityToPlaybackParam(input) {
+  return normalizeQuality(input) === "HIGH"
     ? "high"
     : "flac";
 }
 
-function qualityLabel(quality) {
-  return normalizeQuality(quality) === "HIGH"
+function qualityLabel(input) {
+  return normalizeQuality(input) === "HIGH"
     ? "AAC 320kbps"
     : "LOSSLESS 16-bit / 44.1 kHz";
 }
 
 function formatActualQualityLabel(streamInfo) {
   var q = normalizeQuality(
-    streamInfo && streamInfo.quality
+    streamInfo && (
+      streamInfo.quality ||
+      streamInfo.audioQuality
+    )
   );
 
   var bits = Number(
-    streamInfo && streamInfo.bitDepth
+    streamInfo && (
+      streamInfo.bitDepth ||
+      streamInfo.bit_depth
+    )
   );
 
   var rate = Number(
-    streamInfo && streamInfo.sampleRate
+    streamInfo && (
+      streamInfo.sampleRate ||
+      streamInfo.sample_rate ||
+      streamInfo.samplingRate ||
+      streamInfo.sampling_rate
+    )
   );
 
   if (q === "LOSSLESS" && bits > 0 && rate > 0) {
@@ -117,16 +121,12 @@ function formatActualQualityLabel(streamInfo) {
   return qualityLabel(q);
 }
 
-/*
- * ---------------------------------------------------------
- * Fast bounded cache
- * ---------------------------------------------------------
- *
- * Map insertion order gives us cheap FIFO eviction.
- */
+/* ---------------------------------------------------------
+ * Cache
+ * --------------------------------------------------------- */
 
 function setBoundedCache(map, key, value, maxEntries) {
-  if (map.size >= maxEntries && !map.has(key)) {
+  if (!map.has(key) && map.size >= maxEntries) {
     map.delete(map.keys().next().value);
   }
 
@@ -134,13 +134,7 @@ function setBoundedCache(map, key, value, maxEntries) {
   return value;
 }
 
-/*
- * ---------------------------------------------------------
- * Cache helpers
- * ---------------------------------------------------------
- */
-
-function getFreshCacheEntry(map, key, ttl) {
+function getCache(map, key, ttl) {
   var entry = map.get(key);
 
   if (!entry) {
@@ -158,8 +152,8 @@ function getFreshCacheEntry(map, key, ttl) {
   return entry.value;
 }
 
-function setCacheEntry(map, key, value, maxEntries) {
-  setBoundedCache(
+function putCache(map, key, value, maxEntries) {
+  return setBoundedCache(
     map,
     key,
     {
@@ -168,15 +162,11 @@ function setCacheEntry(map, key, value, maxEntries) {
     },
     maxEntries
   );
-
-  return value;
 }
 
-/*
- * ---------------------------------------------------------
- * Response normalization
- * ---------------------------------------------------------
- */
+/* ---------------------------------------------------------
+ * Search response handling
+ * --------------------------------------------------------- */
 
 function extractItems(res) {
   if (!res) return [];
@@ -189,8 +179,18 @@ function extractItems(res) {
     return res.tracks;
   }
 
-  if (Array.isArray(res.data)) {
-    return res.data;
+  if (res.data) {
+    if (Array.isArray(res.data.tracks)) {
+      return res.data.tracks;
+    }
+
+    if (Array.isArray(res.data.items)) {
+      return res.data.items;
+    }
+
+    if (Array.isArray(res.data)) {
+      return res.data;
+    }
   }
 
   if (Array.isArray(res.items)) {
@@ -201,21 +201,75 @@ function extractItems(res) {
     return res.results;
   }
 
-  if (res.data) {
-    if (Array.isArray(res.data.tracks)) {
-      return res.data.tracks;
-    }
-
-    if (Array.isArray(res.data.items)) {
-      return res.data.items;
-    }
-  }
-
   return [];
 }
 
+/* ---------------------------------------------------------
+ * Safe property helpers
+ * --------------------------------------------------------- */
+
+function firstString() {
+  for (var i = 0; i < arguments.length; i++) {
+    var v = arguments[i];
+
+    if (
+      typeof v === "string" &&
+      v.trim()
+    ) {
+      return v.trim();
+    }
+
+    if (
+      typeof v === "number" &&
+      isFinite(v)
+    ) {
+      return String(v);
+    }
+  }
+
+  return "";
+}
+
+function getNestedString(obj, paths) {
+  for (var i = 0; i < paths.length; i++) {
+    var current = obj;
+
+    for (var j = 0; j < paths[i].length; j++) {
+      if (
+        current == null ||
+        typeof current !== "object"
+      ) {
+        current = null;
+        break;
+      }
+
+      current = current[paths[i][j]];
+    }
+
+    if (
+      typeof current === "string" &&
+      current.trim()
+    ) {
+      return current.trim();
+    }
+
+    if (
+      typeof current === "number" &&
+      isFinite(current)
+    ) {
+      return String(current);
+    }
+  }
+
+  return "";
+}
+
+/* ---------------------------------------------------------
+ * Quality extraction
+ * --------------------------------------------------------- */
+
 function extractTrackQuality(rawItem) {
-  if (!rawItem) {
+  if (!rawItem || typeof rawItem !== "object") {
     return "LOSSLESS";
   }
 
@@ -240,56 +294,140 @@ function extractTrackQuality(rawItem) {
     : "LOSSLESS";
 }
 
-/*
- * ---------------------------------------------------------
- * Track transformation
- * ---------------------------------------------------------
- */
+/* ---------------------------------------------------------
+ * Track normalization
+ *
+ * IMPORTANT:
+ * We DO NOT replace the provider's object shape.
+ * We clone it and preserve all original properties.
+ * --------------------------------------------------------- */
 
 function transformTrackPayload(rawItem, fallbackQuality) {
-  if (!rawItem) {
+  if (
+    !rawItem ||
+    typeof rawItem !== "object"
+  ) {
     return null;
   }
 
-  var rawId =
-    rawItem.id ||
-    rawItem.trackId ||
-    rawItem.track_id ||
-    rawItem.isrc ||
-    "";
+  /*
+   * Preserve the original search result.
+   *
+   * This is the important part that my previous version
+   * screwed up.
+   */
+  var track = Object.assign({}, rawItem);
 
-  var artist =
-    rawItem.artist ||
-    rawItem.artistName ||
-    rawItem.artist_name ||
-    (rawItem.artists &&
-      rawItem.artists[0] &&
-      (
-        rawItem.artists[0].name ||
-        rawItem.artists[0].artistName
-      )) ||
-    "";
+  var title = firstString(
+    rawItem.title,
+    rawItem.name
+  );
 
-  var album =
-    rawItem.album ||
-    rawItem.albumName ||
-    rawItem.album_name ||
-    "";
+  var artist = firstString(
+    rawItem.artistName,
+    rawItem.artist_name,
+    typeof rawItem.artist === "string"
+      ? rawItem.artist
+      : ""
+  );
 
-  var cover =
-    rawItem.cover ||
-    rawItem.coverUrl ||
-    rawItem.cover_url ||
-    rawItem.image ||
-    rawItem.thumbnail ||
-    rawItem.albumArt ||
-    "";
+  if (!artist) {
+    artist = getNestedString(
+      rawItem,
+      [
+        ["artist", "name"],
+        ["artists", "0", "name"],
+        ["artists", "0", "artistName"],
+        ["artist", "artistName"]
+      ]
+    );
+  }
 
-  var isrc =
-    rawItem.isrc ||
-    rawItem.ISRC ||
-    rawItem.external_id ||
-    "";
+  var album = firstString(
+    rawItem.albumName,
+    rawItem.album_name,
+    typeof rawItem.album === "string"
+      ? rawItem.album
+      : ""
+  );
+
+  if (!album) {
+    album = getNestedString(
+      rawItem,
+      [
+        ["album", "title"],
+        ["album", "name"],
+        ["album", "albumName"]
+      ]
+    );
+  }
+
+  var isrc = firstString(
+    rawItem.isrc,
+    rawItem.ISRC,
+    rawItem.external_id
+  );
+
+  var id = firstString(
+    rawItem.id,
+    rawItem.trackId,
+    rawItem.track_id,
+    rawItem.id
+  );
+
+  /*
+   * Only fill missing simple fields.
+   *
+   * If the provider already supplied an object for artist/album,
+   * DON'T overwrite it with a string.
+   */
+
+  if (
+    track.title == null &&
+    title
+  ) {
+    track.title = title;
+  }
+
+  if (
+    track.isrc == null &&
+    isrc
+  ) {
+    track.isrc = isrc;
+  }
+
+  if (
+    track.id == null &&
+    id
+  ) {
+    track.id = id;
+  }
+
+  /*
+   * Do NOT do:
+   *
+   * track.artist = artist
+   *
+   * because the provider might have:
+   *
+   * artist: { name: "..." }
+   *
+   * and 8SPINE may expect that object.
+   */
+
+  if (
+    track.artistName == null &&
+    artist
+  ) {
+    track.artistName = artist;
+  }
+
+  if (
+    track.albumName == null &&
+    album
+  ) {
+    track.albumName = album;
+  }
 
   var quality = extractTrackQuality(
     rawItem
@@ -319,60 +457,55 @@ function transformTrackPayload(rawItem, fallbackQuality) {
     0
   );
 
-  var duration = Number(
-    rawItem.duration ||
-    rawItem.durationMs ||
-    0
+  /*
+   * Again: only add these if they aren't already there.
+   */
+
+  if (
+    track.quality == null
+  ) {
+    track.quality = quality;
+  }
+
+  if (
+    track.bitDepth == null &&
+    bitDepth > 0
+  ) {
+    track.bitDepth = bitDepth;
+  }
+
+  if (
+    track.sampleRate == null &&
+    sampleRate > 0
+  ) {
+    track.sampleRate = sampleRate;
+  }
+
+  /*
+   * Cache the complete provider-compatible object.
+   */
+
+  var cacheId = firstString(
+    rawItem.id,
+    rawItem.trackId,
+    rawItem.track_id,
+    rawItem.isrc,
+    rawItem.ISRC
   );
 
-  /*
-   * Keep this object stable.
-   *
-   * Track objects are cached so the same result doesn't get
-   * reconstructed every time a search is repeated.
-   */
-
-  var track = {
-    id: String(rawId),
-    trackId: String(rawId),
-    isrc: isrc ? String(isrc) : "",
-    title: String(
-      rawItem.title ||
-      rawItem.name ||
-      ""
-    ),
-    artist: String(artist),
-    album: String(album),
-    cover: String(cover),
-    quality: quality,
-    bitDepth: bitDepth,
-    sampleRate: sampleRate,
-    duration: duration,
-
-    /*
-     * Preserve the original object in case the client expects
-     * provider-specific metadata.
-     */
-    raw: rawItem
-  };
-
-  /*
-   * Cache by every useful identifier.
-   */
-
-  if (track.id) {
+  if (cacheId) {
     setBoundedCache(
       trackMap,
-      track.id,
+      cacheId,
       track,
       MAX_TRACK_CACHE
     );
   }
 
-  if (track.isrc) {
+  if (isrc) {
     setBoundedCache(
       trackMap,
-      track.isrc.toLowerCase(),
+      isrc.toLowerCase(),
       track,
       MAX_TRACK_CACHE
     );
@@ -381,20 +514,22 @@ function transformTrackPayload(rawItem, fallbackQuality) {
   return track;
 }
 
-/*
- * ---------------------------------------------------------
+/* ---------------------------------------------------------
  * Search
- * ---------------------------------------------------------
- */
+ * --------------------------------------------------------- */
 
 async function searchTracks(
   query,
   limit,
   context
 ) {
-  limit = limit || 15;
+  limit = Number(limit) || 15;
 
-  query = String(query || "").trim();
+  query = String(
+    query || ""
+  )
+    .replace(/\s+/g, " ")
+    .trim();
 
   if (!query) {
     return {
@@ -404,52 +539,18 @@ async function searchTracks(
   }
 
   /*
-   * Normalize whitespace so:
+   * Quality does NOT belong in the search cache key.
    *
-   * "  Drake   One Dance "
-   *
-   * and
-   *
-   * "Drake One Dance"
-   *
-   * use the same cache entry.
-   */
-
-  query = query
-    .replace(/\s+/g, " ")
-    .trim();
-
-  var selectedQuality =
-    context &&
-    context.settings &&
-    context.settings.audioQuality &&
-    context.settings.audioQuality.value;
-
-  var mappedQuality =
-    normalizeQuality(selectedQuality);
-
-  /*
-   * IMPORTANT:
-   *
-   * Search itself doesn't need to be different just because
-   * playback quality changed.
-   *
-   * Quality belongs to playback resolution, not metadata
-   * discovery.
+   * Search results are metadata.
+   * Playback quality is resolved later.
    */
 
   var cacheKey =
     query.toLowerCase() +
-    "_" +
+    "|" +
     limit;
 
-  /*
-   * -------------------------------------------------------
-   * Instant cache hit
-   * -------------------------------------------------------
-   */
-
-  var cached = getFreshCacheEntry(
+  var cached = getCache(
     searchCache,
     cacheKey,
     SEARCH_TTL
@@ -460,9 +561,8 @@ async function searchTracks(
   }
 
   /*
-   * -------------------------------------------------------
-   * Deduplicate simultaneous requests
-   * -------------------------------------------------------
+   * Prevent duplicate searches when the UI fires the same
+   * request multiple times.
    */
 
   var pending =
@@ -472,12 +572,6 @@ async function searchTracks(
     return pending;
   }
 
-  /*
-   * -------------------------------------------------------
-   * Network request
-   * -------------------------------------------------------
-   */
-
   var requestUrl =
     SEARCH_ENDPOINT +
     "/search?q=" +
@@ -485,19 +579,22 @@ async function searchTracks(
 
   var promise = (async function () {
     try {
-      var res = await fetch(requestUrl, {
-        method: "GET",
-        cache: "default"
-      });
+      var response = await fetch(
+        requestUrl,
+        {
+          method: "GET"
+        }
+      );
 
-      if (!res.ok) {
+      if (!response.ok) {
         throw new Error(
           "Search failed with status " +
-          res.status
+          response.status
         );
       }
 
-      var body = await res.json();
+      var body =
+        await response.json();
 
       var rawTracks =
         extractItems(body);
@@ -507,7 +604,7 @@ async function searchTracks(
         limit
       );
 
-      var formattedTracks =
+      var tracks =
         new Array(count);
 
       for (
@@ -515,26 +612,26 @@ async function searchTracks(
         i < count;
         i++
       ) {
-        formattedTracks[i] =
+        tracks[i] =
           transformTrackPayload(
             rawTracks[i],
-            mappedQuality
+            "LOSSLESS"
           );
       }
 
-      var responsePayload = {
-        tracks: formattedTracks,
+      var result = {
+        tracks: tracks,
         total: count
       };
 
-      setCacheEntry(
+      putCache(
         searchCache,
         cacheKey,
-        responsePayload,
+        result,
         MAX_SEARCH_CACHE
       );
 
-      return responsePayload;
+      return result;
     } finally {
       pendingSearches.delete(
         cacheKey
@@ -550,24 +647,26 @@ async function searchTracks(
   return promise;
 }
 
-/*
- * ---------------------------------------------------------
+/* ---------------------------------------------------------
  * Playback URL
- * ---------------------------------------------------------
- */
+ * --------------------------------------------------------- */
 
 function getTrackStreamUrl(
   trackId,
   preferredQuality,
   context
 ) {
-  if (!trackId) {
+  if (
+    trackId === null ||
+    trackId === undefined ||
+    String(trackId).trim() === ""
+  ) {
     throw new Error(
       "Valid track ID required for stream resolution"
     );
   }
 
-  var requestedQuality =
+  var quality =
     normalizeQuality(
       preferredQuality ||
       (
@@ -579,58 +678,53 @@ function getTrackStreamUrl(
       "LOSSLESS"
     );
 
-  var canonicalTrackId =
+  var id =
     String(trackId).trim();
 
   var qualityParam =
     qualityToPlaybackParam(
-      requestedQuality
+      quality
     );
-
-  /*
-   * This is the exact URL your existing backend expects.
-   */
-
-  var streamUrl =
-    PLAYBACK_ENDPOINT +
-    "/stream?i=" +
-    encodeURIComponent(
-      canonicalTrackId
-    ) +
-    "&quality=" +
-    encodeURIComponent(
-      qualityParam
-    );
-
-  /*
-   * Cache the generated endpoint.
-   *
-   * This doesn't cache the actual Qobuz stream URL;
-   * it simply avoids repeatedly constructing and encoding
-   * the same endpoint.
-   */
 
   var cacheKey =
-    canonicalTrackId +
+    id +
     "|" +
     qualityParam;
 
-  var cached =
-    getFreshCacheEntry(
-      streamCache,
-      cacheKey,
-      STREAM_TTL
-    );
+  var cached = getCache(
+    streamCache,
+    cacheKey,
+    STREAM_TTL
+  );
 
   if (cached) {
     return cached;
   }
 
+  /*
+   * IMPORTANT:
+   *
+   * Your current playback Worker/frontend contract uses:
+   *
+   *     /stream?i=...&quality=...
+   *
+   * Keep that intact.
+   */
+
+  var url =
+    PLAYBACK_ENDPOINT +
+    "/stream?i=" +
+    encodeURIComponent(id) +
+    "&quality=" +
+    encodeURIComponent(
+      qualityParam
+    );
+
   var result = {
-    streamUrl: streamUrl
+    streamUrl: url
   };
 
-  setCacheEntry(
+  putCache(
     streamCache,
     cacheKey,
     result,
@@ -640,57 +734,49 @@ function getTrackStreamUrl(
   return result;
 }
 
-/*
- * ---------------------------------------------------------
- * Optional fast prefetch API
- * ---------------------------------------------------------
+/* ---------------------------------------------------------
+ * Optional prefetch
  *
- * This lets the host application pre-trigger the playback
- * resolver BEFORE the user actually presses play.
- *
- * It is deliberately separate from getTrackStreamUrl() so
- * existing integrations don't break.
- */
+ * This ONLY warms the playback endpoint. It does not alter
+ * the normal playback result.
+ * --------------------------------------------------------- */
 
 function prefetchTrackStreamUrl(
   trackId,
   preferredQuality,
   context
 ) {
-  var result = getTrackStreamUrl(
-    trackId,
-    preferredQuality,
-    context
-  );
+  var result =
+    getTrackStreamUrl(
+      trackId,
+      preferredQuality,
+      context
+    );
 
   /*
-   * Fire and forget.
-   *
-   * The browser/Worker can establish its connection and the
-   * resolver can begin working before playback is requested.
+   * Don't consume the response body.
+   * Just initiate the request so the connection/resolver can
+   * warm up before the user presses play.
    */
 
   try {
     fetch(result.streamUrl, {
-      method: "GET",
-      cache: "default"
+      method: "GET"
     }).catch(function () {});
   } catch (e) {}
 
   return result;
 }
 
-/*
- * ---------------------------------------------------------
- * Public module
- * ---------------------------------------------------------
- */
+/* ---------------------------------------------------------
+ * Module
+ * --------------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.0.0",
+  version: "1.1.0",
 
   description:
     "if yuo are seeing this can i get a hug please",
@@ -728,11 +814,6 @@ return {
   getTrackStreamUrl:
     getTrackStreamUrl,
 
-  /*
-   * Optional.
-   *
-   * Existing callers don't need to change.
-   */
   prefetchTrackStreamUrl:
     prefetchTrackStreamUrl
 };
