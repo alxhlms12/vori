@@ -9,15 +9,15 @@ var pendingSearches = new Map();
 var trackCache = new Map();
 
 /* -------------------------------------------------------
- * Cache
+ * Bounded Cache
  * ----------------------------------------------------- */
 
-function cacheSet(map, key, value, max) {
+function cacheSet(map, key, value, maxEntries) {
   if (map.has(key)) {
     map.delete(key);
   }
 
-  while (map.size >= max) {
+  while (map.size >= maxEntries) {
     map.delete(map.keys().next().value);
   }
 
@@ -26,232 +26,147 @@ function cacheSet(map, key, value, max) {
 }
 
 /* -------------------------------------------------------
- * Quality
- *
- * Playback Worker automatically selects the best quality.
- * The quality setting is therefore only metadata for 8SPINE.
+ * Search Response Extraction
  * ----------------------------------------------------- */
 
-var QUALITY_MAP = {
-  LOSSLESS: "LOSSLESS",
-  FLAC: "LOSSLESS",
-  CD: "LOSSLESS",
-  "16BIT": "LOSSLESS",
-  HIGH: "HIGH",
-  AACLC: "HIGH",
-  AAC320: "HIGH",
-  "320": "HIGH"
-};
+function extractTracks(body) {
+  if (!body) return [];
 
-function normalizeQuality(value) {
-  if (!value) return "LOSSLESS";
-
-  var q = String(value).toUpperCase();
-
-  if (QUALITY_MAP[q]) {
-    return QUALITY_MAP[q];
+  if (Array.isArray(body)) {
+    return body;
   }
 
-  if (q.indexOf("320") !== -1 || q.indexOf("HIGH") !== -1) {
-    return "HIGH";
+  if (Array.isArray(body.tracks)) {
+    return body.tracks;
   }
 
-  return "LOSSLESS";
-}
-
-function qualityLabel(value) {
-  return normalizeQuality(value) === "HIGH"
-    ? "AAC 320kbps"
-    : "LOSSLESS 16-bit / 44.1 kHz";
-}
-
-/* -------------------------------------------------------
- * Response Helpers
- * ----------------------------------------------------- */
-
-function extractTracks(response) {
-  if (!response) return [];
-
-  if (Array.isArray(response)) {
-    return response;
+  if (Array.isArray(body.results)) {
+    return body.results;
   }
 
-  if (Array.isArray(response.tracks)) {
-    return response.tracks;
+  if (Array.isArray(body.items)) {
+    return body.items;
   }
 
-  if (Array.isArray(response.results)) {
-    return response.results;
+  if (Array.isArray(body.data)) {
+    return body.data;
   }
 
-  if (Array.isArray(response.items)) {
-    return response.items;
-  }
-
-  if (Array.isArray(response.data)) {
-    return response.data;
-  }
-
-  if (response.data) {
-    if (Array.isArray(response.data.tracks)) {
-      return response.data.tracks;
+  if (body.data && typeof body.data === "object") {
+    if (Array.isArray(body.data.tracks)) {
+      return body.data.tracks;
     }
 
-    if (Array.isArray(response.data.items)) {
-      return response.data.items;
+    if (Array.isArray(body.data.results)) {
+      return body.data.results;
     }
 
-    if (Array.isArray(response.data.results)) {
-      return response.data.results;
+    if (Array.isArray(body.data.items)) {
+      return body.data.items;
     }
   }
 
   return [];
 }
 
-function getQuality(item) {
-  if (!item) return "LOSSLESS";
-
-  var value =
-    item.audioQuality ||
-    item.quality ||
-    item.qualityLabel ||
-    item.format ||
-    item.audioFormat ||
-    item.formatLabel;
-
-  if (!value && item.attributes) {
-    value =
-      item.attributes.audioQuality ||
-      item.attributes.quality ||
-      item.attributes.format ||
-      item.attributes.audioFormat;
-  }
-
-  return normalizeQuality(value);
-}
-
 /* -------------------------------------------------------
- * Track Normalization
+ * Track Transformation
  * ----------------------------------------------------- */
 
-function normalizeTrack(item, fallbackQuality) {
-  item = item || {};
+function transformTrack(raw) {
+  raw = raw || {};
 
   var isrc = String(
-    item.isrc ||
-    item.ISRC ||
+    raw.isrc ||
+    raw.ISRC ||
     ""
   ).trim();
 
   var id = isrc || String(
-    item.id ||
-    item.trackId ||
+    raw.id ||
+    raw.trackId ||
     ""
   ).trim();
 
   var artist = "Unknown Artist";
 
-  if (typeof item.artist === "string") {
-    artist = item.artist;
-  } else if (item.artist && item.artist.name) {
-    artist = item.artist.name;
-  } else if (item.artistName) {
-    artist = item.artistName;
-  } else if (Array.isArray(item.artists)) {
-    var artistNames = [];
+  if (typeof raw.artist === "string") {
+    artist = raw.artist;
+  } else if (
+    raw.artist &&
+    typeof raw.artist.name === "string"
+  ) {
+    artist = raw.artist.name;
+  } else if (raw.artistName) {
+    artist = String(raw.artistName);
+  } else if (Array.isArray(raw.artists)) {
+    var artists = [];
 
-    for (var i = 0; i < item.artists.length; i++) {
-      var artistItem = item.artists[i];
+    for (var i = 0; i < raw.artists.length; i++) {
+      var artistItem = raw.artists[i];
 
       if (typeof artistItem === "string") {
-        artistNames.push(artistItem);
-      } else if (artistItem && artistItem.name) {
-        artistNames.push(artistItem.name);
+        artists.push(artistItem);
+      } else if (
+        artistItem &&
+        typeof artistItem.name === "string"
+      ) {
+        artists.push(artistItem.name);
       }
     }
 
-    if (artistNames.length) {
-      artist = artistNames.join(", ");
+    if (artists.length) {
+      artist = artists.join(", ");
     }
   }
 
   var album = "";
 
-  if (typeof item.album === "string") {
-    album = item.album;
-  } else if (item.album && item.album.title) {
-    album = item.album.title;
-  } else if (item.albumName) {
-    album = item.albumName;
+  if (typeof raw.album === "string") {
+    album = raw.album;
+  } else if (
+    raw.album &&
+    typeof raw.album.title === "string"
+  ) {
+    album = raw.album.title;
+  } else if (raw.albumName) {
+    album = String(raw.albumName);
   }
 
-  var cover =
-    item.albumCover ||
-    item.cover ||
+  var albumCover =
+    raw.albumCover ||
+    raw.cover ||
     null;
 
-  if (!cover && item.album) {
-    cover =
-      item.album.cover_xl ||
-      item.album.cover_big ||
-      item.album.cover_medium ||
-      item.album.cover ||
+  if (!albumCover && raw.album) {
+    albumCover =
+      raw.album.cover_xl ||
+      raw.album.cover_big ||
+      raw.album.cover_medium ||
+      raw.album.cover ||
       null;
-  }
-
-  var quality = getQuality(item);
-
-  if (!quality) {
-    quality = normalizeQuality(fallbackQuality);
-  }
-
-  var bits = Number(
-    item.bitDepth ||
-    (item.audioInfo && item.audioInfo.bitDepth) ||
-    (item.attributes && item.attributes.bitDepth) ||
-    0
-  );
-
-  var sampleRate = Number(
-    item.sampleRate ||
-    (item.audioInfo && item.audioInfo.sampleRate) ||
-    (item.attributes && item.attributes.sampleRate) ||
-    0
-  );
-
-  if (sampleRate >= 1000) {
-    sampleRate /= 1000;
   }
 
   var track = {
     id: id,
     isrc: isrc || null,
     title:
-      item.title ||
-      item.name ||
-      item.trackName ||
-      item.title_short ||
+      raw.title ||
+      raw.name ||
+      raw.trackName ||
+      raw.title_short ||
       "Unknown Track",
+
     artist: artist,
     album: album,
-    albumCover: cover,
-    duration: Number(item.duration) || 0,
+    albumCover: albumCover,
+    duration: Number(raw.duration) || 0,
+
     trackNumber:
-      item.trackNumber ||
-      item.track_number ||
-      1,
-    audioQuality: qualityLabel(quality),
-    quality: quality
+      raw.trackNumber ||
+      raw.track_number ||
+      1
   };
-
-  if (bits > 0) {
-    track.bitDepth = bits;
-  }
-
-  if (sampleRate > 0) {
-    track.sampleRate = sampleRate;
-  }
 
   if (id) {
     cacheSet(
@@ -271,7 +186,6 @@ function normalizeTrack(item, fallbackQuality) {
 
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim();
-  limit = Number(limit) || 15;
 
   if (!query) {
     return {
@@ -280,22 +194,12 @@ async function searchTracks(query, limit, context) {
     };
   }
 
-  var requestedQuality =
-    context &&
-    context.settings &&
-    context.settings.audioQuality &&
-    context.settings.audioQuality.value;
-
-  requestedQuality = normalizeQuality(
-    requestedQuality || "LOSSLESS"
-  );
+  limit = Number(limit) || 15;
 
   var cacheKey =
     query.toLowerCase() +
     "|" +
-    limit +
-    "|" +
-    requestedQuality;
+    limit;
 
   var cached = searchCache.get(cacheKey);
 
@@ -303,30 +207,33 @@ async function searchTracks(query, limit, context) {
     return cached;
   }
 
-  var pending = pendingSearches.get(cacheKey);
+  var existingRequest =
+    pendingSearches.get(cacheKey);
 
-  if (pending) {
-    return pending;
+  if (existingRequest) {
+    return existingRequest;
   }
 
-  var url =
+  var requestUrl =
     SEARCH_ENDPOINT +
     "/search?q=" +
     encodeURIComponent(query);
 
   var request = (async function() {
     try {
-      var response = await fetch(url);
+      var response = await fetch(requestUrl);
 
       if (!response.ok) {
         throw new Error(
-          "Search failed with status " +
+          "Search failed: HTTP " +
           response.status
         );
       }
 
-      var json = await response.json();
-      var rawTracks = extractTracks(json);
+      var body = await response.json();
+
+      var rawTracks =
+        extractTracks(body);
 
       var count = Math.min(
         rawTracks.length,
@@ -336,10 +243,8 @@ async function searchTracks(query, limit, context) {
       var tracks = new Array(count);
 
       for (var i = 0; i < count; i++) {
-        tracks[i] = normalizeTrack(
-          rawTracks[i],
-          requestedQuality
-        );
+        tracks[i] =
+          transformTrack(rawTracks[i]);
       }
 
       var result = {
@@ -371,25 +276,23 @@ async function searchTracks(query, limit, context) {
 /* -------------------------------------------------------
  * Playback
  *
- * IMPORTANT:
- * The playback Worker accepts ONLY:
+ * The Worker automatically selects the highest
+ * available quality.
  *
- * /stream?i={ISRC}
- *
- * It automatically selects the best available quality.
- *
- * Do not fetch the Worker here.
- * Do not append a quality parameter.
+ * Vori does not attempt to determine or report
+ * the actual stream quality.
  * ----------------------------------------------------- */
 
 function getTrackStreamUrl(trackId, quality, context) {
   var isrc = String(trackId || "").trim();
 
   if (!isrc) {
-    throw new Error("Valid ISRC required for playback");
+    throw new Error(
+      "Valid ISRC required for playback"
+    );
   }
 
-  var cachedTrack = trackCache.get(isrc);
+  var track = trackCache.get(isrc);
 
   return {
     streamUrl:
@@ -397,45 +300,24 @@ function getTrackStreamUrl(trackId, quality, context) {
       "/stream?i=" +
       encodeURIComponent(isrc),
 
-    track: cachedTrack || {
+    track: track || {
       id: isrc,
-      isrc: isrc,
-      audioQuality: qualityLabel(quality),
-      quality: normalizeQuality(quality)
+      isrc: isrc
     }
   };
 }
 
 /* -------------------------------------------------------
- * Module
+ * 8SPINE Module
  * ----------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.2.1",
+  version: "1.2.2",
   description:
-    "@._.alx.",
-
-  settings: {
-    audioQuality: {
-      type: "selector",
-      label: "Streaming Audio Quality",
-      description: "Preferred audio target quality",
-      options: [
-        {
-          label: "Lossless (FLAC 16-bit / 44.1 kHz)",
-          value: "LOSSLESS"
-        },
-        {
-          label: "High Quality (AAC 320kbps)",
-          value: "HIGH"
-        }
-      ],
-      defaultValue: "LOSSLESS"
-    }
-  },
+    "coming to regular vori sometime idfk",
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
