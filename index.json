@@ -1,16 +1,18 @@
 {
-  "category:modules": [
-    {
+  "category:modules": [ 
+	  {
       "id": "vori",
       "name": "vori",
       "download": "vori.js",
       "version": "v1.5.0",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "Didy blud module 4 Qobuz :skull:",
+      "description": "uh vori ahh",
+      "tags": ["HI-RES", "DOBLY ATMOS", "TIDAL", "APPLE MUSIC"],
       "featured": true,
       "trusted": true
     },
+
     {
       "id": "vori-test",
       "name": "vori-test",
@@ -18,9 +20,8 @@
       "version": "v1.0.0",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "Official test branch, this branch may be unstable.",
+      "description": "test for vori obviously",
+      "tags": ["HI-RES", "DOBLY ATMOS", "QOBUZ"],
       "featured": true,
       "trusted": true
     }
-  ]
-}
