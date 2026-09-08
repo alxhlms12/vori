@@ -16,10 +16,10 @@
       "id": "vori-test",
       "name": "vori-test",
       "download": "https://raw.githubusercontent.com/alxhlms12/vori/refs/heads/main/voritest.js",
-      "version": "v1.2.4",
+      "version": "v1.2.5",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "Ultra-fast Deezer integration with speculative ISRC preloading (gemini wrote this)",
+      "description": "forgot to update the version information in the module itself, there will be a mismatch,",
       "tags": ["HI-RES", "QOBUZ"],
       "featured": true,
       "trusted": true
