@@ -16,10 +16,10 @@
       "id": "vori-test",
       "name": "vori-test",
       "download": "https://raw.githubusercontent.com/alxhlms12/vori/refs/heads/main/voritest.js",
-      "version": "v1.2.5",
+      "version": "v1.2.6",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "forgot to update the version information in the module itself, there will be a mismatch,",
+      "description": "hi",
       "tags": ["HI-RES", "QOBUZ"],
       "featured": true,
       "trusted": true
