@@ -1,4 +1,4 @@
-var SEARCH_ENDPOINT = "https://search.alxhlms.workers.dev";
+var DEEZER_API_BASE = "https://api.deezer.com";
 var PLAYBACK_ENDPOINT = "https://playback.alxhlms.workers.dev";
 
 var MAX_SEARCH_CACHE = 100;
@@ -6,66 +6,28 @@ var MAX_TRACK_CACHE = 1000;
 
 var searchCache = new Map();
 var pendingSearches = new Map();
-var trackMap = new Map();
+var trackCache = new Map();
+var isrcPromises = new Map();
 
 /* -------------------------------------------------------
- * Eager Connection & Socket Pre-Warming
+ * Connection Pre-warmer
+ * Wakes Cloudflare Worker & keeps TLS socket alive in pool
  * ----------------------------------------------------- */
 
-(function prewarmSockets() {
-  try {
-    fetch(SEARCH_ENDPOINT + "/ping", { method: "HEAD", mode: "no-cors", priority: "low" }).catch(function() {});
-    fetch(PLAYBACK_ENDPOINT + "/ping", { method: "HEAD", mode: "no-cors", priority: "low" }).catch(function() {});
-  } catch (e) {}
-})();
-
-/* -------------------------------------------------------
- * Quality Helpers
- * ----------------------------------------------------- */
-
-var QUAL_MAP = {
-  LOSSLESS: "LOSSLESS",
-  FLAC: "LOSSLESS",
-  CD: "LOSSLESS",
-  "16BIT": "LOSSLESS",
-  HIGH: "HIGH",
-  AACLC: "HIGH",
-  AAC320: "HIGH",
-  "320": "HIGH"
-};
-
-function normalizeQuality(input) {
-  if (!input) return "LOSSLESS";
-  var s = String(input).toUpperCase();
-  return QUAL_MAP[s] || (s.indexOf("HIGH") !== -1 || s.indexOf("320") !== -1 ? "HIGH" : "LOSSLESS");
-}
-
-function qualityToPlaybackParam(quality) {
-  return normalizeQuality(quality) === "HIGH" ? "high" : "flac";
-}
-
-function qualityLabel(quality) {
-  return normalizeQuality(quality) === "HIGH" ? "AAC 320kbps" : "LOSSLESS 16-bit / 44.1 kHz";
-}
-
-function formatActualQualityLabel(streamInfo) {
-  var q = normalizeQuality(streamInfo && streamInfo.quality);
-  var bits = Number(streamInfo && streamInfo.bitDepth);
-  var rate = Number(streamInfo && streamInfo.sampleRate);
-
-  if (q === "LOSSLESS" && bits > 0 && rate > 0) {
-    return "LOSSLESS " + bits + "-bit / " + rate + " kHz";
-  }
-
-  return qualityLabel(q);
+function prewarmPlaybackStream(isrc) {
+  if (!isrc) return;
+  var streamUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc);
+  // Fire-and-forget HEAD request to warm TLS + Cloudflare Worker isolate
+  fetch(streamUrl, { method: "HEAD" }).catch(function () {});
 }
 
 /* -------------------------------------------------------
- * O(1) Map Cache Eviction
+ * Bounded Cache Helper
  * ----------------------------------------------------- */
 
-function setBoundedCache(map, key, value, maxEntries) {
-  if (map.size >= maxEntries) {
+function cacheSet(map, key, value, maxEntries) {
+  if (map.has(key)) map.delete(key);
+  while (map.size >= maxEntries) {
     map.delete(map.keys().next().value);
   }
   map.set(key, value);
@@ -73,224 +35,280 @@ function setBoundedCache(map, key, value, maxEntries) {
 }
 
 /* -------------------------------------------------------
- * Response Parsing
+ * Smart Deezer Result Ranking
  * ----------------------------------------------------- */
 
-function extractItems(res) {
-  if (!res) return [];
-  if (Array.isArray(res)) return res;
-  if (Array.isArray(res.tracks)) return res.tracks;
-  if (Array.isArray(res.data)) return res.data;
-  if (Array.isArray(res.items)) return res.items;
-  if (Array.isArray(res.results)) return res.results;
-  if (res.data) {
-    if (Array.isArray(res.data.tracks)) return res.data.tracks;
-    if (Array.isArray(res.data.items)) return res.data.items;
-  }
-  return [];
-}
+function sortAndFilterDeezerTracks(rawTracks, query) {
+  if (!Array.isArray(rawTracks) || rawTracks.length === 0) return [];
 
-function extractTrackQuality(rawItem) {
-  if (!rawItem) return "LOSSLESS";
+  var q = (query || "").toLowerCase();
+  var isSearchingKaraoke = q.includes("karaoke");
+  var isSearchingTribute = q.includes("tribute") || q.includes("cover");
+  var isSearchingLive = q.includes("live");
+  var isSearchingRemix = q.includes("remix");
 
-  var q = rawItem.audioQuality || rawItem.quality || rawItem.qualityLabel || rawItem.format || rawItem.audioFormat || rawItem.formatLabel;
-  if (!q && rawItem.attributes) {
-    q = rawItem.attributes.audioQuality || rawItem.attributes.quality || rawItem.attributes.format || rawItem.attributes.audioFormat;
-  }
-  return q ? normalizeQuality(q) : "LOSSLESS";
+  return rawTracks.slice().sort(function (a, b) {
+    var scoreA = 0;
+    var scoreB = 0;
+
+    var artistA = (a.artist && a.artist.name ? a.artist.name : "").toLowerCase();
+    var artistB = (b.artist && b.artist.name ? b.artist.name : "").toLowerCase();
+    var titleA = (a.title || "").toLowerCase();
+    var titleB = (b.title || "").toLowerCase();
+
+    if (!isSearchingKaraoke) {
+      if (artistA.includes("karaoke") || titleA.includes("karaoke")) scoreA -= 60;
+      if (artistB.includes("karaoke") || titleB.includes("karaoke")) scoreB -= 60;
+    }
+    if (!isSearchingTribute) {
+      if (artistA.includes("tribute") || titleA.includes("tribute") || titleA.includes("cover version")) scoreA -= 50;
+      if (artistB.includes("tribute") || titleB.includes("tribute") || titleB.includes("cover version")) scoreB -= 50;
+    }
+
+    if (!isSearchingLive) {
+      if (titleA.includes("live") || titleA.includes("en vivo")) scoreA -= 20;
+      if (titleB.includes("live") || titleB.includes("en vivo")) scoreB -= 20;
+    }
+    if (!isSearchingRemix) {
+      if (titleA.includes("remix") || titleA.includes("mixed")) scoreA -= 15;
+      if (titleB.includes("remix") || titleB.includes("mixed")) scoreB -= 15;
+    }
+
+    if (artistA && q.includes(artistA)) scoreA += 40;
+    if (artistB && q.includes(artistB)) scoreB += 40;
+
+    return scoreB - scoreA;
+  });
 }
 
 /* -------------------------------------------------------
- * Track Transformation
+ * Optimized Priority ISRC Preloader
  * ----------------------------------------------------- */
 
-function transformTrackPayload(rawItem, fallbackQuality) {
-  if (!rawItem) rawItem = {};
+function preloadTrackIsrc(trackId, shouldPrewarm) {
+  var id = String(trackId || "").trim();
+  if (!id || !/^\d+$/.test(id)) return Promise.resolve(null);
 
-  var actualQuality = extractTrackQuality(rawItem);
-  if (actualQuality === "AUTO") {
-    actualQuality = normalizeQuality(fallbackQuality);
+  var track = trackCache.get(id);
+  if (track && track.isrc) {
+    if (shouldPrewarm) prewarmPlaybackStream(track.isrc);
+    return Promise.resolve(track.isrc);
   }
+  if (isrcPromises.has(id)) return isrcPromises.get(id);
 
-  var artistName = "Unknown Artist";
-  var rawArtist = rawItem.artist;
+  var promise = (async function () {
+    try {
+      var res = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(id));
+      if (!res.ok) return null;
 
-  if (typeof rawArtist === "string") {
-    artistName = rawArtist;
-  } else if (rawArtist && typeof rawArtist.name === "string") {
-    artistName = rawArtist.name;
-  } else if (rawItem.artistName) {
-    artistName = rawItem.artistName;
-  } else if (Array.isArray(rawItem.artists) && rawItem.artists.length > 0) {
-    var names = [];
-    var artists = rawItem.artists;
-    for (var i = 0; i < artists.length; i++) {
-      var a = artists[i];
-      names.push(a && a.name ? a.name : a);
+      var data = await res.json();
+      if (data && data.isrc) {
+        var isrc = String(data.isrc).trim();
+        if (track) {
+          track.isrc = isrc;
+        }
+        cacheSet(trackCache, isrc, track || { id: id, isrc: isrc }, MAX_TRACK_CACHE);
+        cacheSet(trackCache, id, Object.assign({}, track || { id: id }, { isrc: isrc }), MAX_TRACK_CACHE);
+
+        // Pre-warm the playback endpoint concurrently!
+        if (shouldPrewarm) {
+          prewarmPlaybackStream(isrc);
+        }
+
+        return isrc;
+      }
+    } catch (e) {
+    } finally {
+      // Clean up in-flight map after resolution to prevent memory leaks
+      isrcPromises.delete(id);
     }
-    artistName = names.join(", ");
+    return null;
+  })();
+
+  isrcPromises.set(id, promise);
+  return promise;
+}
+
+/* -------------------------------------------------------
+ * Deezer Track Transformation
+ * ----------------------------------------------------- */
+
+function transformDeezerTrack(raw) {
+  raw = raw || {};
+
+  var id = String(raw.id || "").trim();
+  var isrc = String(raw.isrc || raw.ISRC || "").trim() || null;
+
+  var artist = "Unknown Artist";
+  if (raw.artist && typeof raw.artist.name === "string") {
+    artist = raw.artist.name.trim();
   }
 
-  var albumName = "";
-  var rawAlbum = rawItem.album;
+  var album = (raw.album && raw.album.title) ? raw.album.title.trim() : "";
+  var albumCover = raw.album
+    ? (raw.album.cover_xl || raw.album.cover_big || raw.album.cover_medium || null)
+    : null;
 
-  if (typeof rawAlbum === "string") {
-    albumName = rawAlbum;
-  } else if (rawAlbum && typeof rawAlbum.title === "string") {
-    albumName = rawAlbum.title;
-  } else if (rawItem.albumName) {
-    albumName = rawItem.albumName;
-  }
+  var title = String(raw.title || raw.title_short || "Unknown Track").trim();
 
-  var albumCover = rawItem.albumCover || rawItem.cover || null;
-  if (!albumCover && rawAlbum) {
-    albumCover = rawAlbum.cover_xl || rawAlbum.cover_big || rawAlbum.cover_medium || rawAlbum.cover || null;
-  }
-
-  var canonicalIsrc = String(rawItem.isrc || rawItem.ISRC || "").trim();
-  var trackId = canonicalIsrc || String(rawItem.id || rawItem.trackId || "");
-
-  var bits = Number(rawItem.bitDepth || (rawItem.audioInfo && rawItem.audioInfo.bitDepth) || (rawItem.attributes && rawItem.attributes.bitDepth) || 0);
-  var rate = Number(rawItem.sampleRate || (rawItem.audioInfo && rawItem.audioInfo.sampleRate) || (rawItem.attributes && rawItem.attributes.sampleRate) || 0);
-  if (rate >= 1000) rate /= 1000;
-
-  var transformed = {
-    id: trackId,
-    isrc: canonicalIsrc || null,
-    title: rawItem.title || rawItem.name || rawItem.trackName || rawItem.title_short || "Unknown Track",
-    artist: artistName,
-    album: albumName,
+  var track = {
+    id: id,
+    isrc: isrc,
+    title: title,
+    artist: artist,
+    album: album,
     albumCover: albumCover,
-    duration: Number(rawItem.duration) || 0,
-    trackNumber: rawItem.trackNumber || rawItem.track_number || 1,
-    audioQuality: qualityLabel(actualQuality),
-    quality: actualQuality
+    duration: Number(raw.duration) || 0,
+    trackNumber: Number(raw.track_position || raw.track_number) || 1
   };
 
-  if (bits > 0) transformed.bitDepth = bits;
-  if (rate > 0) transformed.sampleRate = rate;
+  if (id) cacheSet(trackCache, id, track, MAX_TRACK_CACHE);
+  if (isrc) cacheSet(trackCache, isrc, track, MAX_TRACK_CACHE);
 
-  if (trackId) {
-    setBoundedCache(trackMap, trackId, transformed, MAX_TRACK_CACHE);
-  }
-
-  return transformed;
+  return track;
 }
 
 /* -------------------------------------------------------
- * Search Tracks (High Priority Execution)
+ * Search
  * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
-  limit = limit || 15;
-  query = String(query || "").trim();
+  query = String(query || "").trim().replace(/\s+/g, " ");
 
-  if (!query) {
-    return { tracks: [], total: 0 };
-  }
+  if (!query) return { tracks: [], total: 0 };
 
-  var selectedQuality = context?.settings?.audioQuality?.value || "LOSSLESS";
-  var mappedQuality = normalizeQuality(selectedQuality);
-  var mappedQualityParam = qualityToPlaybackParam(mappedQuality);
+  limit = Number(limit) || 10;
+  var cacheKey = query.toLowerCase() + "|" + limit;
 
-  var cacheKey = query.toLowerCase() + "_" + limit + "_" + mappedQualityParam;
+  var cached = searchCache.get(cacheKey);
+  if (cached) return cached;
 
-  if (searchCache.has(cacheKey)) {
-    return searchCache.get(cacheKey);
-  }
+  var existingRequest = pendingSearches.get(cacheKey);
+  if (existingRequest) return existingRequest;
 
-  if (pendingSearches.has(cacheKey)) {
-    return pendingSearches.get(cacheKey);
-  }
+  var requestUrl =
+    DEEZER_API_BASE +
+    "/search/track?q=" +
+    encodeURIComponent(query) +
+    "&limit=" +
+    encodeURIComponent(limit);
 
-  var requestUrl = SEARCH_ENDPOINT + "/search?q=" + encodeURIComponent(query) + "&quality=" + mappedQualityParam;
-
-  var promise = (async function() {
+  var request = (async function () {
     try {
-      var res = await fetch(requestUrl, {
-        priority: "high",
-        keepalive: true
-      });
+      var response = await fetch(requestUrl);
+      if (!response.ok) throw new Error("HTTP " + response.status);
 
-      if (!res.ok) {
-        throw new Error("Search failed with status " + res.status);
-      }
+      var body = await response.json();
+      if (body.error) throw new Error(body.error.message || "Deezer error");
 
-      var body = await res.json();
-      var rawTracks = extractItems(body);
-      var count = Math.min(rawTracks.length, limit);
-      var formattedTracks = new Array(count);
+      var rawTracks = Array.isArray(body.data) ? body.data : [];
+      var sortedRawTracks = sortAndFilterDeezerTracks(rawTracks, query);
+
+      var count = Math.min(sortedRawTracks.length, limit);
+      var tracks = new Array(count);
 
       for (var i = 0; i < count; i++) {
-        formattedTracks[i] = transformTrackPayload(rawTracks[i], mappedQuality);
+        tracks[i] = transformDeezerTrack(sortedRawTracks[i]);
       }
 
-      var responsePayload = {
-        tracks: formattedTracks,
-        total: count
-      };
+      // Priority Lane: Give Candidate 0 the entire network connection first
+      if (tracks.length > 0 && tracks[0].id) {
+        preloadTrackIsrc(tracks[0].id, true); // true = prewarm worker connection
+      }
 
-      setBoundedCache(searchCache, cacheKey, responsePayload, MAX_SEARCH_CACHE);
-      return responsePayload;
+      // Stagger Candidate 1 so it doesn't compete for Candidate 0's mobile socket
+      if (tracks.length > 1 && tracks[1].id) {
+        setTimeout(function () {
+          preloadTrackIsrc(tracks[1].id, false);
+        }, 50);
+      }
+
+      var result = { tracks: tracks, total: Number(body.total) || count };
+      cacheSet(searchCache, cacheKey, result, MAX_SEARCH_CACHE);
+      return result;
     } finally {
       pendingSearches.delete(cacheKey);
     }
   })();
 
-  pendingSearches.set(cacheKey, promise);
-  return promise;
+  pendingSearches.set(cacheKey, request);
+  return request;
 }
 
 /* -------------------------------------------------------
- * Instant Stream Resolution
+ * Playback
  * ----------------------------------------------------- */
 
-function getTrackStreamUrl(trackId, preferredQuality, context) {
-  if (!trackId) {
-    throw new Error("Valid track ID required for stream resolution");
+async function getTrackStreamUrl(trackId, quality, context) {
+  var id = String(trackId || "").trim();
+  if (!id) throw new Error("Valid track ID or ISRC required for playback");
+
+  // 1. FAST PATH: 8SPINE context already has the ISRC (0ms delay)
+  var contextIsrc =
+    (context && typeof context.isrc === "string" && context.isrc.trim()) ||
+    (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
+    null;
+
+  if (contextIsrc) {
+    prewarmPlaybackStream(contextIsrc);
+    return {
+      streamUrl: PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(contextIsrc),
+      track: { id: contextIsrc, isrc: contextIsrc, audioQuality: quality || "HIGH" }
+    };
   }
 
-  var requestedQuality = normalizeQuality(
-    preferredQuality || context?.settings?.audioQuality?.value || "LOSSLESS"
-  );
+  // 2. Direct ISRC check
+  var isrc = null;
+  if (/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id)) {
+    isrc = id;
+  }
 
-  var canonicalTrackId = String(trackId).trim();
-  var qualityParam = qualityToPlaybackParam(requestedQuality);
+  // 3. Check memory cache
+  var track = trackCache.get(id);
+  if (!isrc && track && track.isrc) {
+    isrc = track.isrc;
+  }
+
+  // 4. Resolve ISRC if numeric Deezer ID
+  if (!isrc && /^\d+$/.test(id)) {
+    var inFlight = isrcPromises.get(id);
+    if (inFlight) {
+      isrc = await inFlight;
+    }
+    if (!isrc) {
+      isrc = await preloadTrackIsrc(id, true);
+    }
+  }
+
+  // 5. Strict check: never pass numeric IDs to the worker
+  if (!isrc) {
+    throw new Error("Could not resolve a valid ISRC for track: " + id);
+  }
 
   return {
-    streamUrl: PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(canonicalTrackId) + "&quality=" + qualityParam
+    streamUrl:
+      PLAYBACK_ENDPOINT +
+      "/stream?i=" +
+      encodeURIComponent(isrc),
+
+    track: Object.assign({}, track || { id: isrc, isrc: isrc }, {
+      id: isrc,
+      isrc: isrc,
+      audioQuality: quality || "HIGH"
+    })
   };
 }
 
 /* -------------------------------------------------------
- * 8Spine Module Definition
+ * 8SPINE Module
  * ----------------------------------------------------- */
 
 return {
   id: "vori",
   name: "vori",
   author: "alxhlms",
-  version: "1.5.0",
-  description: "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
-
-  settings: {
-    audioQuality: {
-      type: "selector",
-      label: "Streaming Audio Quality",
-      description: "Preferred audio target quality",
-      options: [
-        {
-          label: "Lossless (FLAC 16-bit / 44.1 kHz)",
-          value: "LOSSLESS"
-        },
-        {
-          label: "High Quality (AAC 320kbps)",
-          value: "HIGH"
-        }
-      ],
-      defaultValue: "LOSSLESS"
-    }
-  },
+  version: "1.5.1",
+  description: "Currently Identical to the regular build of Vori (unstable)",
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
