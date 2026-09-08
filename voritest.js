@@ -7,6 +7,7 @@ var MAX_TRACK_CACHE = 1000;
 var searchCache = new Map();
 var pendingSearches = new Map();
 var trackCache = new Map();
+var isrcPromises = new Map(); // In-flight speculative prefetch map
 
 /* -------------------------------------------------------
  * Bounded Cache Helper
@@ -16,13 +17,48 @@ function cacheSet(map, key, value, maxEntries) {
   if (map.has(key)) {
     map.delete(key);
   }
-
   while (map.size >= maxEntries) {
     map.delete(map.keys().next().value);
   }
-
   map.set(key, value);
   return value;
+}
+
+/* -------------------------------------------------------
+ * Speculative ISRC Preloader
+ * Kicks off concurrently so 8SPINE never waits on playback
+ * ----------------------------------------------------- */
+
+function preloadTrackIsrc(trackId) {
+  var id = String(trackId || "").trim();
+  if (!id || !/^\d+$/.test(id)) return;
+
+  var track = trackCache.get(id);
+  if (track && track.isrc) return; // Already resolved
+  if (isrcPromises.has(id)) return; // Already in-flight
+
+  var promise = (async function () {
+    try {
+      var res = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(id));
+      if (!res.ok) return null;
+
+      var data = await res.json();
+      if (data && data.isrc) {
+        if (track) {
+          track.isrc = data.isrc;
+          cacheSet(trackCache, data.isrc, track, MAX_TRACK_CACHE);
+        }
+        return data.isrc;
+      }
+    } catch (e) {
+      // Silent catch: getTrackStreamUrl will handle fallbacks
+    } finally {
+      isrcPromises.delete(id);
+    }
+    return null;
+  })();
+
+  isrcPromises.set(id, promise);
 }
 
 /* -------------------------------------------------------
@@ -35,7 +71,6 @@ function transformDeezerTrack(raw) {
   var id = String(raw.id || "").trim();
   var isrc = String(raw.isrc || raw.ISRC || "").trim() || null;
 
-  // Deezer provides clean artist and album objects
   var artist = "Unknown Artist";
   if (raw.artist && typeof raw.artist.name === "string") {
     artist = raw.artist.name;
@@ -84,38 +119,32 @@ function transformDeezerTrack(raw) {
  * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
-  query = String(query || "").trim();
+  query = String(query || "").trim().replace(/\s+/g, " ");
 
   if (!query) {
-    return {
-      tracks: [],
-      total: 0
-    };
+    return { tracks: [], total: 0 };
   }
 
-  limit = Number(limit) || 15;
+  // 10 items is optimal: fast JSON transfer and sufficient for Stream Helper
+  limit = Number(limit) || 10;
 
   var cacheKey = query.toLowerCase() + "|" + limit;
 
   var cached = searchCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
+  if (cached) return cached;
 
   var existingRequest = pendingSearches.get(cacheKey);
-  if (existingRequest) {
-    return existingRequest;
-  }
+  if (existingRequest) return existingRequest;
 
-  // Deezer public search endpoint with limit
+  // Uses the dedicated /search/track index
   var requestUrl =
     DEEZER_API_BASE +
-    "/search?q=" +
+    "/search/track?q=" +
     encodeURIComponent(query) +
     "&limit=" +
     encodeURIComponent(limit);
 
-  var request = (async function() {
+  var request = (async function () {
     try {
       var response = await fetch(requestUrl);
 
@@ -137,6 +166,11 @@ async function searchTracks(query, limit, context) {
         tracks[i] = transformDeezerTrack(rawTracks[i]);
       }
 
+      // Speculatively preload the top candidate's ISRC in the background!
+      if (tracks.length > 0 && tracks[0].id) {
+        preloadTrackIsrc(tracks[0].id);
+      }
+
       var result = {
         tracks: tracks,
         total: Number(body.total) || count
@@ -155,9 +189,6 @@ async function searchTracks(query, limit, context) {
 
 /* -------------------------------------------------------
  * Playback
- *
- * If the worker requires an ISRC and the track is a Deezer ID,
- * it fetches the ISRC on-demand from Deezer's /track/{id}.
  * ----------------------------------------------------- */
 
 async function getTrackStreamUrl(trackId, quality, context) {
@@ -170,33 +201,29 @@ async function getTrackStreamUrl(trackId, quality, context) {
   var track = trackCache.get(id);
   var isrc = track ? track.isrc : null;
 
-  // Standard 12-character alphanumeric ISRC check (e.g. USUM71820728)
+  // Direct ISRC format check
   var isIsrc = /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id);
   if (isIsrc) {
     isrc = id;
   }
 
-  // If we don't have an ISRC yet and this is a Deezer numeric ID, look it up on-demand
+  // Resolve ISRC if missing
   if (!isrc && /^\d+$/.test(id)) {
-    try {
-      var trackRes = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(id));
-      if (trackRes.ok) {
-        var trackData = await trackRes.json();
-        if (trackData && trackData.isrc) {
-          isrc = trackData.isrc;
+    var inFlight = isrcPromises.get(id);
 
-          if (track) {
-            track.isrc = isrc;
-            cacheSet(trackCache, isrc, track, MAX_TRACK_CACHE);
-          }
-        }
+    if (inFlight) {
+      // Background preload was already triggered by searchTracks: just wait on it!
+      isrc = await inFlight;
+    } else {
+      // Wasn't preloaded; fetch it directly
+      preloadTrackIsrc(id);
+      var fetchPromise = isrcPromises.get(id);
+      if (fetchPromise) {
+        isrc = await fetchPromise;
       }
-    } catch (e) {
-      // Fall back to original ID if Deezer lookup fails
     }
   }
 
-  // Use resolved ISRC if available; otherwise use the original identifier
   var playbackIdentifier = isrc || id;
 
   return {
@@ -220,8 +247,8 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.2.3",
-  description: "replaces my ass search endpoint lol",
+  version: "1.2.4",
+  description: "Ultra-fast Deezer integration with speculative ISRC preloading (gemini wrote this)",
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
