@@ -307,8 +307,8 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.5.5",
-  description: "Accurate Deezer integration with maximum pipeline parallelization",
+  version: "1.2.6",
+  description: "Currently Identical to the regular build of Vori (stable)",
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
