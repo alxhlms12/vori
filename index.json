@@ -25,15 +25,15 @@
       "trusted": false
   },
   {
-      "id": "placeholder",
-      "name": "ALL IN ONE MODULE COMING SOON",
+      "id": "PLACEHOLDER",
+      "name": "PLACEHOLDER",
       "download": "No Download Destination",
-      "version": "placeholder",
+      "version": "PLACEHOLDER",
       "type": "MODULE",
-      "author": "alxhlms",
-      "description": "Updates, Do Not Install.",
-      "tags": ["LOSSLESS AND LOSSY", "Updates Channel"],
-      "featured": false,
+      "author": "NO SPECIFIC AUTHOR",
+      "description": "All-In-One 8SPINE Module Coming Soon, a mix of lossless, and lossy sources.",
+      "tags": ["DON'T INSTALL", "UPDATES CHANNEL"],
+      "featured": true,
       "trusted": true
     }
   ]
