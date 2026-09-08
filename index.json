@@ -7,7 +7,7 @@
       "version": "v1.5.0",
       "type": "MODULE",
       "author": "alxhlms",
-      "description": "Ultra-low-latency 8SPINE resolver optimized for Lossless and AAC 320",
+      "description": "Ultra-high-latency 8SPINE resolver optimized for Lossless and AAC 320",
       "tags": ["HI-RES", "QOBUZ"],
       "featured": true,
       "trusted": true
