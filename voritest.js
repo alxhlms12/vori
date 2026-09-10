@@ -9,19 +9,11 @@ var pendingSearches = new Map();
 var trackCache = new Map();
 var isrcPromises = new Map();
 
-/* -------------------------------------------------------
- * Connection Pre-warmer
- * ----------------------------------------------------- */
-
 function prewarmPlaybackStream(isrc) {
   if (!isrc) return;
   var streamUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc);
   fetch(streamUrl, { method: "HEAD" }).catch(function () {});
 }
-
-/* -------------------------------------------------------
- * Bounded Cache Helper
- * ----------------------------------------------------- */
 
 function cacheSet(map, key, value, maxEntries) {
   if (map.has(key)) map.delete(key);
@@ -31,10 +23,6 @@ function cacheSet(map, key, value, maxEntries) {
   map.set(key, value);
   return value;
 }
-
-/* -------------------------------------------------------
- * Smart Deezer Result Ranking
- * ----------------------------------------------------- */
 
 function sortAndFilterDeezerTracks(rawTracks, query) {
   if (!Array.isArray(rawTracks) || rawTracks.length === 0) return [];
@@ -78,10 +66,6 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
   });
 }
 
-/* -------------------------------------------------------
- * Priority ISRC Preloader
- * ----------------------------------------------------- */
-
 function preloadTrackIsrc(trackId) {
   var id = String(trackId || "").trim();
   if (!id || !/^\d+$/.test(id)) return Promise.resolve(null);
@@ -123,10 +107,6 @@ function preloadTrackIsrc(trackId) {
   return promise;
 }
 
-/* -------------------------------------------------------
- * Deezer Track Transformation
- * ----------------------------------------------------- */
-
 function transformDeezerTrack(raw) {
   raw = raw || {};
 
@@ -162,10 +142,6 @@ function transformDeezerTrack(raw) {
 
   return track;
 }
-
-/* -------------------------------------------------------
- * Search
- * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim().replace(/\s+/g, " ");
@@ -224,10 +200,6 @@ async function searchTracks(query, limit, context) {
   return request;
 }
 
-/* -------------------------------------------------------
- * Quality Badge Formatter
- * ----------------------------------------------------- */
-
 function map8SpineQuality(qualityStr, audioQualityEnum) {
   if (audioQualityEnum === "HI_RES" || audioQualityEnum === "LOSSLESS" || audioQualityEnum === "HIGH") {
     return audioQualityEnum;
@@ -242,17 +214,12 @@ function map8SpineQuality(qualityStr, audioQualityEnum) {
   return "HIGH";
 }
 
-/* -------------------------------------------------------
- * Playback (Routes through Cloudflare Worker Proxy)
- * ----------------------------------------------------- */
-
 async function getTrackStreamUrl(trackId, quality, context) {
   var inputId = String(trackId || "").trim();
   if (!inputId) throw new Error("Valid track ID or ISRC required for playback");
 
   var isrc = null;
 
-  // 1. Context check
   var contextIsrc =
     (context && typeof context.isrc === "string" && context.isrc.trim()) ||
     (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
@@ -262,18 +229,15 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = contextIsrc;
   }
 
-  // 2. Direct ISRC check
   if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(inputId)) {
     isrc = inputId;
   }
 
-  // 3. Cache check
   var track = trackCache.get(inputId);
   if (!isrc && track && track.isrc) {
     isrc = track.isrc;
   }
 
-  // 4. Resolve from Deezer ID if needed
   if (!isrc && /^\d+$/.test(inputId)) {
     var inFlight = isrcPromises.get(inputId);
     if (inFlight) {
@@ -288,7 +252,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
     throw new Error("Could not resolve ISRC for track: " + inputId);
   }
 
-  // Fetch JSON stream details from the Worker to get accurate quality metadata
+  // Retrieve track quality metadata from worker
   var workerUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc) + "&json";
   var res = await fetch(workerUrl);
 
@@ -303,34 +267,27 @@ async function getTrackStreamUrl(trackId, quality, context) {
 
   var resolvedBadge = map8SpineQuality(data.quality, data.audioQuality);
 
-  // Use PLAYBACK_ENDPOINT so the worker proxies audio bytes (bypassing Deezer 403 Forbidden)
-  var playableStreamUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc);
-
   return {
-    streamUrl: playableStreamUrl,
+    streamUrl: PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc),
     track: {
-      id: inputId, // Preserves original queue ID (fixes infinite loading)
+      id: inputId,
       isrc: isrc,
       title: (track && track.title) || (context && context.track && context.track.title) || "",
       artist: (track && track.artist) || (context && context.track && context.track.artist) || "",
       album: (track && track.album) || (context && context.track && context.track.album) || "",
       albumCover: (track && track.albumCover) || (context && context.track && context.track.albumCover) || null,
       duration: (track && track.duration) || (context && context.track && context.track.duration) || 0,
-      audioQuality: resolvedBadge // Renders 'LOSSLESS' badge
+      audioQuality: resolvedBadge
     }
   };
 }
-
-/* -------------------------------------------------------
- * 8SPINE Module Export
- * ----------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.3.0",
-  description: "High-Res playback via Qobuz and Deezer",
+  version: "1.3.1",
+  description: "High-Res playback via Deezer and Qobuz",
   labels: ["FLAC", "LOSSLESS", "HI-RES"],
 
   searchTracks: searchTracks,
