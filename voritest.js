@@ -79,7 +79,7 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
 }
 
 /* -------------------------------------------------------
- * Priority ISRC Preloader (Calls CORS-friendly Worker)
+ * Priority ISRC Preloader
  * ----------------------------------------------------- */
 
 function preloadTrackIsrc(trackId) {
@@ -94,7 +94,6 @@ function preloadTrackIsrc(trackId) {
 
   var promise = (async function () {
     try {
-      // Query worker CORS proxy first
       var res = await fetch(PLAYBACK_ENDPOINT + "/track?id=" + encodeURIComponent(id));
       if (!res.ok) {
         res = await fetch(DEEZER_API_FALLBACK + "/track/" + encodeURIComponent(id));
@@ -147,7 +146,7 @@ function transformDeezerTrack(raw) {
   var title = String(raw.title || raw.title_short || "Unknown Track").trim();
 
   var track = {
-    id: id, // Keep original Deezer ID
+    id: id,
     isrc: isrc,
     title: title,
     artist: artist,
@@ -165,14 +164,13 @@ function transformDeezerTrack(raw) {
 }
 
 /* -------------------------------------------------------
- * Search (Proxied through Worker to eliminate CORS error)
+ * Search
  * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim().replace(/\s+/g, " ");
   if (!query) return { tracks: [], total: 0 };
 
-  // Guarantee at least 10 items
   var effectiveLimit = Math.max(Number(limit) || 10, 10);
   var cacheKey = query.toLowerCase() + "|" + effectiveLimit;
 
@@ -182,7 +180,6 @@ async function searchTracks(query, limit, context) {
   var existingRequest = pendingSearches.get(cacheKey);
   if (existingRequest) return existingRequest;
 
-  // Use Worker /search proxy to avoid CORS blocks
   var requestUrl =
     PLAYBACK_ENDPOINT +
     "/search?q=" +
@@ -194,7 +191,6 @@ async function searchTracks(query, limit, context) {
     try {
       var response = await fetch(requestUrl);
       if (!response.ok) {
-        // Fallback to direct Deezer endpoint if worker proxy is unavailable
         response = await fetch(DEEZER_API_FALLBACK + "/search?q=" + encodeURIComponent(query) + "&limit=25");
       }
       if (!response.ok) throw new Error("Search HTTP " + response.status);
@@ -212,7 +208,6 @@ async function searchTracks(query, limit, context) {
         tracks[i] = transformDeezerTrack(sortedRawTracks[i]);
       }
 
-      // Preload top candidate ISRC in the background
       if (tracks.length > 0 && tracks[0].id) {
         preloadTrackIsrc(tracks[0].id);
       }
@@ -248,7 +243,7 @@ function map8SpineQuality(qualityStr, audioQualityEnum) {
 }
 
 /* -------------------------------------------------------
- * Playback (Fixes Infinite Loading & Track Mismatch)
+ * Playback (Routes through Cloudflare Worker Proxy)
  * ----------------------------------------------------- */
 
 async function getTrackStreamUrl(trackId, quality, context) {
@@ -257,7 +252,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
 
   var isrc = null;
 
-  // 1. Check context
+  // 1. Context check
   var contextIsrc =
     (context && typeof context.isrc === "string" && context.isrc.trim()) ||
     (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
@@ -272,13 +267,13 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = inputId;
   }
 
-  // 3. Cache lookup
+  // 3. Cache check
   var track = trackCache.get(inputId);
   if (!isrc && track && track.isrc) {
     isrc = track.isrc;
   }
 
-  // 4. Resolve ISRC from Deezer ID if needed
+  // 4. Resolve from Deezer ID if needed
   if (!isrc && /^\d+$/.test(inputId)) {
     var inFlight = isrcPromises.get(inputId);
     if (inFlight) {
@@ -293,7 +288,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
     throw new Error("Could not resolve ISRC for track: " + inputId);
   }
 
-  // Fetch JSON stream details from the Worker
+  // Fetch JSON stream details from the Worker to get accurate quality metadata
   var workerUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc) + "&json";
   var res = await fetch(workerUrl);
 
@@ -302,20 +297,27 @@ async function getTrackStreamUrl(trackId, quality, context) {
   }
 
   var data = await res.json();
-  if (!data || !data.streamUrl) {
-    throw new Error("Worker did not return a stream URL");
+  if (!data || (!data.streamUrl && !data.source)) {
+    throw new Error("Worker did not return a valid stream response");
   }
 
   var resolvedBadge = map8SpineQuality(data.quality, data.audioQuality);
 
-  // CRITICAL: track.id MUST equal inputId (not isrc) to prevent infinite loading & mismatch errors!
+  // Use PLAYBACK_ENDPOINT so the worker proxies audio bytes (bypassing Deezer 403 Forbidden)
+  var playableStreamUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc);
+
   return {
-    streamUrl: data.streamUrl,
-    track: Object.assign({}, track || {}, {
-      id: inputId,
+    streamUrl: playableStreamUrl,
+    track: {
+      id: inputId, // Preserves original queue ID (fixes infinite loading)
       isrc: isrc,
-      audioQuality: resolvedBadge
-    })
+      title: (track && track.title) || (context && context.track && context.track.title) || "",
+      artist: (track && track.artist) || (context && context.track && context.track.artist) || "",
+      album: (track && track.album) || (context && context.track && context.track.album) || "",
+      albumCover: (track && track.albumCover) || (context && context.track && context.track.albumCover) || null,
+      duration: (track && track.duration) || (context && context.track && context.track.duration) || 0,
+      audioQuality: resolvedBadge // Renders 'LOSSLESS' badge
+    }
   };
 }
 
@@ -327,9 +329,9 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.2.9",
+  version: "1.3.0",
   description: "High-Res playback via Qobuz and Deezer",
-  labels: ["DEEZER", "QOBUZ", "CD-QUALITY"],
+  labels: ["FLAC", "LOSSLESS", "HI-RES"],
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
