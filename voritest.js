@@ -80,7 +80,7 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
 }
 
 /* -------------------------------------------------------
- * Optimized Priority ISRC Preloader
+ * Priority ISRC Preloader
  * ----------------------------------------------------- */
 
 function preloadTrackIsrc(trackId, shouldPrewarm) {
@@ -155,7 +155,8 @@ function transformDeezerTrack(raw) {
     album: album,
     albumCover: albumCover,
     duration: Number(raw.duration) || 0,
-    trackNumber: Number(raw.track_position || raw.track_number) || 1
+    trackNumber: Number(raw.track_position || raw.track_number) || 1,
+    audioQuality: "LOSSLESS" // Informs 8SPINE this candidate supports Hi-Fi
   };
 
   if (id) cacheSet(trackCache, id, track, MAX_TRACK_CACHE);
@@ -165,16 +166,16 @@ function transformDeezerTrack(raw) {
 }
 
 /* -------------------------------------------------------
- * Search
+ * Search (Fixed endpoint & enforces minimum 10 results)
  * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim().replace(/\s+/g, " ");
-
   if (!query) return { tracks: [], total: 0 };
 
-  limit = Number(limit) || 10;
-  var cacheKey = query.toLowerCase() + "|" + limit;
+  // Always enforce a minimum of 10 tracks
+  var effectiveLimit = Math.max(Number(limit) || 10, 10);
+  var cacheKey = query.toLowerCase() + "|" + effectiveLimit;
 
   var cached = searchCache.get(cacheKey);
   if (cached) return cached;
@@ -182,12 +183,12 @@ async function searchTracks(query, limit, context) {
   var existingRequest = pendingSearches.get(cacheKey);
   if (existingRequest) return existingRequest;
 
+  // Uses the official /search endpoint (not /search/track) and fetches 25 to guarantee >= 10 post-filter
   var requestUrl =
     DEEZER_API_BASE +
-    "/search/track?q=" +
+    "/search?q=" +
     encodeURIComponent(query) +
-    "&limit=" +
-    encodeURIComponent(limit);
+    "&limit=25";
 
   var request = (async function () {
     try {
@@ -200,24 +201,20 @@ async function searchTracks(query, limit, context) {
       var rawTracks = Array.isArray(body.data) ? body.data : [];
       var sortedRawTracks = sortAndFilterDeezerTracks(rawTracks, query);
 
-      var count = Math.min(sortedRawTracks.length, limit);
+      // Take at least 10 (or up to effectiveLimit)
+      var count = Math.min(sortedRawTracks.length, effectiveLimit);
       var tracks = new Array(count);
 
       for (var i = 0; i < count; i++) {
         tracks[i] = transformDeezerTrack(sortedRawTracks[i]);
       }
 
+      // Preload ISRC for the top result in background without blocking UI
       if (tracks.length > 0 && tracks[0].id) {
-        preloadTrackIsrc(tracks[0].id, true);
+        preloadTrackIsrc(tracks[0].id, false);
       }
 
-      if (tracks.length > 1 && tracks[1].id) {
-        setTimeout(function () {
-          preloadTrackIsrc(tracks[1].id, false);
-        }, 50);
-      }
-
-      var result = { tracks: tracks, total: Number(body.total) || count };
+      var result = { tracks: tracks, total: Math.max(Number(body.total) || 0, tracks.length) };
       cacheSet(searchCache, cacheKey, result, MAX_SEARCH_CACHE);
       return result;
     } finally {
@@ -230,6 +227,24 @@ async function searchTracks(query, limit, context) {
 }
 
 /* -------------------------------------------------------
+ * Quality Badge Mapper for 8SPINE
+ * ----------------------------------------------------- */
+
+function map8SpineQuality(qualityStr, audioQualityEnum) {
+  if (audioQualityEnum === "HI_RES" || audioQualityEnum === "LOSSLESS" || audioQualityEnum === "HIGH") {
+    return audioQualityEnum;
+  }
+  var q = String(qualityStr || "").toUpperCase();
+  if (q.includes("24-BIT") || q.includes("HI-RES") || q.includes("HI_RES") || q.includes("96") || q.includes("192")) {
+    return "HI_RES";
+  }
+  if (q.includes("FLAC") || q.includes("LOSSLESS") || q.includes("16-BIT")) {
+    return "LOSSLESS";
+  }
+  return "HIGH";
+}
+
+/* -------------------------------------------------------
  * Playback
  * ----------------------------------------------------- */
 
@@ -239,7 +254,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
 
   var isrc = null;
 
-  // 1. FAST PATH: Check context
+  // 1. Check context
   var contextIsrc =
     (context && typeof context.isrc === "string" && context.isrc.trim()) ||
     (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
@@ -249,25 +264,25 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = contextIsrc;
   }
 
-  // 2. Direct ISRC check
+  // 2. Direct ISRC string check
   if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id)) {
     isrc = id;
   }
 
-  // 3. Check memory cache
+  // 3. Cache lookup
   var track = trackCache.get(id);
   if (!isrc && track && track.isrc) {
     isrc = track.isrc;
   }
 
-  // 4. Resolve ISRC from Deezer ID if needed
+  // 4. Resolve from Deezer API if numeric ID
   if (!isrc && /^\d+$/.test(id)) {
     var inFlight = isrcPromises.get(id);
     if (inFlight) {
       isrc = await inFlight;
     }
     if (!isrc) {
-      isrc = await preloadTrackIsrc(id, true);
+      isrc = await preloadTrackIsrc(id, false);
     }
   }
 
@@ -275,7 +290,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
     throw new Error("Could not resolve a valid ISRC for track: " + id);
   }
 
-  // Fetch JSON stream details from the Worker
+  // Query worker with &json to retrieve direct playable link and quality metadata
   var workerUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc) + "&json";
   var res = await fetch(workerUrl);
 
@@ -285,15 +300,18 @@ async function getTrackStreamUrl(trackId, quality, context) {
 
   var data = await res.json();
   if (!data || !data.streamUrl) {
-    throw new Error("Worker did not return a stream URL");
+    throw new Error("Worker did not return a playable stream URL");
   }
+
+  // Standardized badge for 8SPINE
+  var resolvedQualityBadge = map8SpineQuality(data.quality, data.audioQuality);
 
   return {
     streamUrl: data.streamUrl,
     track: Object.assign({}, track || { id: isrc, isrc: isrc }, {
       id: isrc,
       isrc: isrc,
-      audioQuality: data.quality || quality || "LOSSLESS"
+      audioQuality: resolvedQualityBadge
     })
   };
 }
@@ -306,9 +324,9 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.2.7",
-  description: "High-Res playback via Deezer and Qobuz",
-  labels: ["DEEZER", "QOBUZ", "CD-QUALITY"], // Crucial for 8SPINE stream resolution
+  version: "1.2.8",
+  description: "High-Res playback via Qobuz and Deezer",
+  labels: ["DEEZER", "QOBUZ", "CD-QUALITY"],
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
