@@ -308,7 +308,7 @@ return {
   author: "alxhlms",
   version: "1.2.7",
   description: "High-Res playback via Deezer and Qobuz",
-  labels: ["FLAC", "LOSSLESS", "HI-RES"], // Crucial for 8SPINE stream resolution
+  labels: ["DEEZER", "QOBUZ", "CD-QUALITY"], // Crucial for 8SPINE stream resolution
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
