@@ -1,5 +1,5 @@
-var DEEZER_API_BASE = "https://api.deezer.com";
 var PLAYBACK_ENDPOINT = "https://playback.alxhlms.workers.dev";
+var DEEZER_API_FALLBACK = "https://api.deezer.com";
 
 var MAX_SEARCH_CACHE = 100;
 var MAX_TRACK_CACHE = 1000;
@@ -62,7 +62,6 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
       if (artistA.includes("tribute") || titleA.includes("tribute") || titleA.includes("cover version")) scoreA -= 50;
       if (artistB.includes("tribute") || titleB.includes("tribute") || titleB.includes("cover version")) scoreB -= 50;
     }
-
     if (!isSearchingLive) {
       if (titleA.includes("live") || titleA.includes("en vivo")) scoreA -= 20;
       if (titleB.includes("live") || titleB.includes("en vivo")) scoreB -= 20;
@@ -80,38 +79,38 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
 }
 
 /* -------------------------------------------------------
- * Priority ISRC Preloader
+ * Priority ISRC Preloader (Calls CORS-friendly Worker)
  * ----------------------------------------------------- */
 
-function preloadTrackIsrc(trackId, shouldPrewarm) {
+function preloadTrackIsrc(trackId) {
   var id = String(trackId || "").trim();
   if (!id || !/^\d+$/.test(id)) return Promise.resolve(null);
 
-  var track = trackCache.get(id);
-  if (track && track.isrc) {
-    if (shouldPrewarm) prewarmPlaybackStream(track.isrc);
-    return Promise.resolve(track.isrc);
+  var cachedTrack = trackCache.get(id);
+  if (cachedTrack && cachedTrack.isrc) {
+    return Promise.resolve(cachedTrack.isrc);
   }
   if (isrcPromises.has(id)) return isrcPromises.get(id);
 
   var promise = (async function () {
     try {
-      var res = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(id));
+      // Query worker CORS proxy first
+      var res = await fetch(PLAYBACK_ENDPOINT + "/track?id=" + encodeURIComponent(id));
+      if (!res.ok) {
+        res = await fetch(DEEZER_API_FALLBACK + "/track/" + encodeURIComponent(id));
+      }
       if (!res.ok) return null;
 
       var data = await res.json();
       if (data && data.isrc) {
         var isrc = String(data.isrc).trim();
-        if (track) {
-          track.isrc = isrc;
+        if (cachedTrack) {
+          cachedTrack.isrc = isrc;
         }
-        cacheSet(trackCache, isrc, track || { id: id, isrc: isrc }, MAX_TRACK_CACHE);
-        cacheSet(trackCache, id, Object.assign({}, track || { id: id }, { isrc: isrc }), MAX_TRACK_CACHE);
+        cacheSet(trackCache, isrc, cachedTrack || { id: id, isrc: isrc }, MAX_TRACK_CACHE);
+        cacheSet(trackCache, id, Object.assign({}, cachedTrack || { id: id }, { isrc: isrc }), MAX_TRACK_CACHE);
 
-        if (shouldPrewarm) {
-          prewarmPlaybackStream(isrc);
-        }
-
+        prewarmPlaybackStream(isrc);
         return isrc;
       }
     } catch (e) {
@@ -148,7 +147,7 @@ function transformDeezerTrack(raw) {
   var title = String(raw.title || raw.title_short || "Unknown Track").trim();
 
   var track = {
-    id: id,
+    id: id, // Keep original Deezer ID
     isrc: isrc,
     title: title,
     artist: artist,
@@ -156,7 +155,7 @@ function transformDeezerTrack(raw) {
     albumCover: albumCover,
     duration: Number(raw.duration) || 0,
     trackNumber: Number(raw.track_position || raw.track_number) || 1,
-    audioQuality: "LOSSLESS" // Informs 8SPINE this candidate supports Hi-Fi
+    audioQuality: "LOSSLESS"
   };
 
   if (id) cacheSet(trackCache, id, track, MAX_TRACK_CACHE);
@@ -166,14 +165,14 @@ function transformDeezerTrack(raw) {
 }
 
 /* -------------------------------------------------------
- * Search (Fixed endpoint & enforces minimum 10 results)
+ * Search (Proxied through Worker to eliminate CORS error)
  * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim().replace(/\s+/g, " ");
   if (!query) return { tracks: [], total: 0 };
 
-  // Always enforce a minimum of 10 tracks
+  // Guarantee at least 10 items
   var effectiveLimit = Math.max(Number(limit) || 10, 10);
   var cacheKey = query.toLowerCase() + "|" + effectiveLimit;
 
@@ -183,25 +182,29 @@ async function searchTracks(query, limit, context) {
   var existingRequest = pendingSearches.get(cacheKey);
   if (existingRequest) return existingRequest;
 
-  // Uses the official /search endpoint (not /search/track) and fetches 25 to guarantee >= 10 post-filter
+  // Use Worker /search proxy to avoid CORS blocks
   var requestUrl =
-    DEEZER_API_BASE +
+    PLAYBACK_ENDPOINT +
     "/search?q=" +
     encodeURIComponent(query) +
-    "&limit=25";
+    "&limit=" +
+    Math.max(effectiveLimit, 25);
 
   var request = (async function () {
     try {
       var response = await fetch(requestUrl);
-      if (!response.ok) throw new Error("HTTP " + response.status);
+      if (!response.ok) {
+        // Fallback to direct Deezer endpoint if worker proxy is unavailable
+        response = await fetch(DEEZER_API_FALLBACK + "/search?q=" + encodeURIComponent(query) + "&limit=25");
+      }
+      if (!response.ok) throw new Error("Search HTTP " + response.status);
 
       var body = await response.json();
-      if (body.error) throw new Error(body.error.message || "Deezer error");
+      if (body.error) throw new Error(body.error.message || "Search error");
 
       var rawTracks = Array.isArray(body.data) ? body.data : [];
       var sortedRawTracks = sortAndFilterDeezerTracks(rawTracks, query);
 
-      // Take at least 10 (or up to effectiveLimit)
       var count = Math.min(sortedRawTracks.length, effectiveLimit);
       var tracks = new Array(count);
 
@@ -209,9 +212,9 @@ async function searchTracks(query, limit, context) {
         tracks[i] = transformDeezerTrack(sortedRawTracks[i]);
       }
 
-      // Preload ISRC for the top result in background without blocking UI
+      // Preload top candidate ISRC in the background
       if (tracks.length > 0 && tracks[0].id) {
-        preloadTrackIsrc(tracks[0].id, false);
+        preloadTrackIsrc(tracks[0].id);
       }
 
       var result = { tracks: tracks, total: Math.max(Number(body.total) || 0, tracks.length) };
@@ -227,7 +230,7 @@ async function searchTracks(query, limit, context) {
 }
 
 /* -------------------------------------------------------
- * Quality Badge Mapper for 8SPINE
+ * Quality Badge Formatter
  * ----------------------------------------------------- */
 
 function map8SpineQuality(qualityStr, audioQualityEnum) {
@@ -238,19 +241,19 @@ function map8SpineQuality(qualityStr, audioQualityEnum) {
   if (q.includes("24-BIT") || q.includes("HI-RES") || q.includes("HI_RES") || q.includes("96") || q.includes("192")) {
     return "HI_RES";
   }
-  if (q.includes("FLAC") || q.includes("LOSSLESS") || q.includes("16-BIT")) {
+  if (q.includes("16-BIT") || q.includes("LOSSLESS") || q.includes("FLAC")) {
     return "LOSSLESS";
   }
   return "HIGH";
 }
 
 /* -------------------------------------------------------
- * Playback
+ * Playback (Fixes Infinite Loading & Track Mismatch)
  * ----------------------------------------------------- */
 
 async function getTrackStreamUrl(trackId, quality, context) {
-  var id = String(trackId || "").trim();
-  if (!id) throw new Error("Valid track ID or ISRC required for playback");
+  var inputId = String(trackId || "").trim();
+  if (!inputId) throw new Error("Valid track ID or ISRC required for playback");
 
   var isrc = null;
 
@@ -264,33 +267,33 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = contextIsrc;
   }
 
-  // 2. Direct ISRC string check
-  if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id)) {
-    isrc = id;
+  // 2. Direct ISRC check
+  if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(inputId)) {
+    isrc = inputId;
   }
 
   // 3. Cache lookup
-  var track = trackCache.get(id);
+  var track = trackCache.get(inputId);
   if (!isrc && track && track.isrc) {
     isrc = track.isrc;
   }
 
-  // 4. Resolve from Deezer API if numeric ID
-  if (!isrc && /^\d+$/.test(id)) {
-    var inFlight = isrcPromises.get(id);
+  // 4. Resolve ISRC from Deezer ID if needed
+  if (!isrc && /^\d+$/.test(inputId)) {
+    var inFlight = isrcPromises.get(inputId);
     if (inFlight) {
       isrc = await inFlight;
     }
     if (!isrc) {
-      isrc = await preloadTrackIsrc(id, false);
+      isrc = await preloadTrackIsrc(inputId);
     }
   }
 
   if (!isrc) {
-    throw new Error("Could not resolve a valid ISRC for track: " + id);
+    throw new Error("Could not resolve ISRC for track: " + inputId);
   }
 
-  // Query worker with &json to retrieve direct playable link and quality metadata
+  // Fetch JSON stream details from the Worker
   var workerUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc) + "&json";
   var res = await fetch(workerUrl);
 
@@ -300,18 +303,18 @@ async function getTrackStreamUrl(trackId, quality, context) {
 
   var data = await res.json();
   if (!data || !data.streamUrl) {
-    throw new Error("Worker did not return a playable stream URL");
+    throw new Error("Worker did not return a stream URL");
   }
 
-  // Standardized badge for 8SPINE
-  var resolvedQualityBadge = map8SpineQuality(data.quality, data.audioQuality);
+  var resolvedBadge = map8SpineQuality(data.quality, data.audioQuality);
 
+  // CRITICAL: track.id MUST equal inputId (not isrc) to prevent infinite loading & mismatch errors!
   return {
     streamUrl: data.streamUrl,
-    track: Object.assign({}, track || { id: isrc, isrc: isrc }, {
-      id: isrc,
+    track: Object.assign({}, track || {}, {
+      id: inputId,
       isrc: isrc,
-      audioQuality: resolvedQualityBadge
+      audioQuality: resolvedBadge
     })
   };
 }
@@ -324,7 +327,7 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.2.8",
+  version: "1.2.9",
   description: "High-Res playback via Qobuz and Deezer",
   labels: ["DEEZER", "QOBUZ", "CD-QUALITY"],
 
