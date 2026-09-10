@@ -10,10 +10,6 @@ var pendingSearches = new Map();
 var trackCache = new Map();
 var isrcPromises = new Map();
 
-/* -------------------------------------------------------
- * Bounded Cache Helper
- * ----------------------------------------------------- */
-
 function cacheSet(map, key, value, maxEntries) {
   if (map.has(key)) map.delete(key);
   while (map.size >= maxEntries) {
@@ -22,10 +18,6 @@ function cacheSet(map, key, value, maxEntries) {
   map.set(key, value);
   return value;
 }
-
-/* -------------------------------------------------------
- * Smart Deezer Result Ranking
- * ----------------------------------------------------- */
 
 function sortAndFilterDeezerTracks(rawTracks, query) {
   if (!Array.isArray(rawTracks) || rawTracks.length === 0) return [];
@@ -69,10 +61,6 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
   });
 }
 
-/* -------------------------------------------------------
- * ISRC Preloader
- * ----------------------------------------------------- */
-
 function preloadTrackIsrc(trackId) {
   var id = String(trackId || "").trim();
   if (!id || !/^\d+$/.test(id)) return Promise.resolve(null);
@@ -108,10 +96,6 @@ function preloadTrackIsrc(trackId) {
   isrcPromises.set(id, promise);
   return promise;
 }
-
-/* -------------------------------------------------------
- * Deezer Track Transformation
- * ----------------------------------------------------- */
 
 function transformDeezerTrack(raw) {
   raw = raw || {};
@@ -149,10 +133,6 @@ function transformDeezerTrack(raw) {
   return track;
 }
 
-/* -------------------------------------------------------
- * Search (Enforces minimum 10 items)
- * ----------------------------------------------------- */
-
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim().replace(/\s+/g, " ");
   if (!query) return { tracks: [], total: 0 };
@@ -166,7 +146,6 @@ async function searchTracks(query, limit, context) {
   var existingRequest = pendingSearches.get(cacheKey);
   if (existingRequest) return existingRequest;
 
-  // Requests 25 candidates so after filtering, >= 10 results are guaranteed
   var requestUrl =
     DEEZER_API_BASE +
     "/search?q=" +
@@ -207,10 +186,6 @@ async function searchTracks(query, limit, context) {
   return request;
 }
 
-/* -------------------------------------------------------
- * Direct Worker Fetchers
- * ----------------------------------------------------- */
-
 async function fetchFromQobuz(isrc) {
   var url = QOBUZ_WORKER + "/?isrc=" + encodeURIComponent(isrc);
   var res = await fetch(url);
@@ -221,14 +196,13 @@ async function fetchFromQobuz(isrc) {
     throw new Error("No Qobuz streamUrl");
   }
 
-  // Parse Qobuz bit_depth & sampling_rate
   var bitDepth = Number(data.bit_depth) || 16;
   var samplingRate = Number(data.sampling_rate) || 44.1;
   var isHiRes = bitDepth > 16 || samplingRate > 48;
 
   return {
     provider: "qobuz",
-    streamUrl: data.streamUrl, // Direct Akamai CDN link
+    streamUrl: data.streamUrl,
     audioQuality: isHiRes ? "HI_RES" : "LOSSLESS",
     title: data.title,
     artist: data.artist,
@@ -240,14 +214,26 @@ async function fetchFromQobuz(isrc) {
 async function fetchFromDeezer(isrc) {
   var url = DEEZER_WORKER + "/?isrc=" + encodeURIComponent(isrc);
   var res = await fetch(url);
-  if (!res.ok) throw new Error("Deezer HTTP " + res.status);
+  if (!res.ok) throw new Error("Deezer Metadata HTTP " + res.status);
 
   var data = await res.json();
   if (!data || !data.streamUrl) {
-    throw new Error("No Deezer streamUrl");
+    throw new Error("Deezer returned no streamUrl in JSON");
   }
 
-  // Deezer returns format: "FLAC", quality: "16-bit / 44.1kHz Lossless"
+  // Probe the streamUrl to verify the worker is returning audio rather than a 403, 500, or CORS block
+  try {
+    var probeRes = await fetch(data.streamUrl, {
+      method: "GET",
+      headers: { "Range": "bytes=0-1" }
+    });
+    if (!probeRes.ok && probeRes.status !== 206) {
+      throw new Error("Deezer stream server returned HTTP " + probeRes.status);
+    }
+  } catch (probeErr) {
+    throw new Error("Deezer stream endpoint unreachable: " + probeErr.message);
+  }
+
   var rawQuality = String(data.quality || data.format || "").toUpperCase();
   var audioQuality = "LOSSLESS";
   if (rawQuality.includes("320") || rawQuality.includes("MP3")) {
@@ -256,7 +242,7 @@ async function fetchFromDeezer(isrc) {
 
   return {
     provider: "deezer",
-    streamUrl: data.streamUrl, // Direct deezer.alxhlms.workers.dev/stream decryptor link
+    streamUrl: data.streamUrl,
     audioQuality: audioQuality,
     title: data.title,
     artist: data.artist,
@@ -265,17 +251,12 @@ async function fetchFromDeezer(isrc) {
   };
 }
 
-/* -------------------------------------------------------
- * Playback (Races Qobuz & Deezer directly from the client)
- * ----------------------------------------------------- */
-
 async function getTrackStreamUrl(trackId, quality, context) {
   var inputId = String(trackId || "").trim();
   if (!inputId) throw new Error("Valid track ID or ISRC required for playback");
 
   var isrc = null;
 
-  // 1. Context check
   var contextIsrc =
     (context && typeof context.isrc === "string" && context.isrc.trim()) ||
     (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
@@ -285,18 +266,15 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = contextIsrc;
   }
 
-  // 2. Direct ISRC string check
   if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(inputId)) {
     isrc = inputId;
   }
 
-  // 3. Cache lookup
   var track = trackCache.get(inputId);
   if (!isrc && track && track.isrc) {
     isrc = track.isrc;
   }
 
-  // 4. Resolve from Deezer API if numeric ID
   if (!isrc && /^\d+$/.test(inputId)) {
     var inFlight = isrcPromises.get(inputId);
     if (inFlight) {
@@ -311,25 +289,28 @@ async function getTrackStreamUrl(trackId, quality, context) {
     throw new Error("Could not resolve ISRC for track: " + inputId);
   }
 
-  // RACE: Fire both Qobuz and Deezer concurrently. Whichever answers first wins!
+  // Strategy: Try Qobuz first (direct Akamai CDN). If unavailable, fall back to Deezer.
   var result = null;
+  var qobuzError = null;
+
   try {
-    result = await Promise.any([
-      fetchFromQobuz(isrc),
-      fetchFromDeezer(isrc)
-    ]);
+    result = await fetchFromQobuz(isrc);
   } catch (err) {
-    var details = err instanceof AggregateError
-      ? err.errors.map(function(e) { return e.message; }).join(" | ")
-      : err.message;
-    throw new Error("Both Qobuz and Deezer failed: " + details);
+    qobuzError = err.message;
+  }
+
+  if (!result) {
+    try {
+      result = await fetchFromDeezer(isrc);
+    } catch (deezerErr) {
+      throw new Error("Playback failed. Qobuz: " + qobuzError + " | Deezer: " + deezerErr.message);
+    }
   }
 
   if (!result || !result.streamUrl) {
-    throw new Error("No stream URL available for track: " + inputId);
+    throw new Error("No playable stream URL resolved for ISRC: " + isrc);
   }
 
-  // CRITICAL: track.id MUST equal inputId to prevent 8SPINE infinite loading & track mismatches!
   return {
     streamUrl: result.streamUrl,
     track: {
@@ -340,22 +321,18 @@ async function getTrackStreamUrl(trackId, quality, context) {
       album: result.album || (track && track.album) || "",
       albumCover: (track && track.albumCover) || null,
       duration: result.duration || (track && track.duration) || 0,
-      audioQuality: result.audioQuality // 'HI_RES' | 'LOSSLESS' | 'HIGH'
+      audioQuality: result.audioQuality
     }
   };
 }
-
-/* -------------------------------------------------------
- * 8SPINE Module Export
- * ----------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.4.0",
-  description: "Direct High-Res playback via Qobuz & Deezer",
-  labels: ["FLAC", "LOSSLESS", "GRRR"],
+  version: "1.4.1",
+  description: "Direct High-Res playback via Qobuz with Deezer fallback",
+  labels: ["FLAC", "LOSSLESS", "HI-RES"],
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
