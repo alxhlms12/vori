@@ -1,5 +1,6 @@
-var PLAYBACK_ENDPOINT = "https://playback.alxhlms.workers.dev";
-var DEEZER_API_FALLBACK = "https://api.deezer.com";
+var DEEZER_API_BASE = "https://api.deezer.com";
+var QOBUZ_WORKER = "https://qobuz.alxhlms.workers.dev";
+var DEEZER_WORKER = "https://deezer.alxhlms.workers.dev";
 
 var MAX_SEARCH_CACHE = 100;
 var MAX_TRACK_CACHE = 1000;
@@ -9,11 +10,9 @@ var pendingSearches = new Map();
 var trackCache = new Map();
 var isrcPromises = new Map();
 
-function prewarmPlaybackStream(isrc) {
-  if (!isrc) return;
-  var streamUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc);
-  fetch(streamUrl, { method: "HEAD" }).catch(function () {});
-}
+/* -------------------------------------------------------
+ * Bounded Cache Helper
+ * ----------------------------------------------------- */
 
 function cacheSet(map, key, value, maxEntries) {
   if (map.has(key)) map.delete(key);
@@ -23,6 +22,10 @@ function cacheSet(map, key, value, maxEntries) {
   map.set(key, value);
   return value;
 }
+
+/* -------------------------------------------------------
+ * Smart Deezer Result Ranking
+ * ----------------------------------------------------- */
 
 function sortAndFilterDeezerTracks(rawTracks, query) {
   if (!Array.isArray(rawTracks) || rawTracks.length === 0) return [];
@@ -66,6 +69,10 @@ function sortAndFilterDeezerTracks(rawTracks, query) {
   });
 }
 
+/* -------------------------------------------------------
+ * ISRC Preloader
+ * ----------------------------------------------------- */
+
 function preloadTrackIsrc(trackId) {
   var id = String(trackId || "").trim();
   if (!id || !/^\d+$/.test(id)) return Promise.resolve(null);
@@ -78,10 +85,7 @@ function preloadTrackIsrc(trackId) {
 
   var promise = (async function () {
     try {
-      var res = await fetch(PLAYBACK_ENDPOINT + "/track?id=" + encodeURIComponent(id));
-      if (!res.ok) {
-        res = await fetch(DEEZER_API_FALLBACK + "/track/" + encodeURIComponent(id));
-      }
+      var res = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(id));
       if (!res.ok) return null;
 
       var data = await res.json();
@@ -92,8 +96,6 @@ function preloadTrackIsrc(trackId) {
         }
         cacheSet(trackCache, isrc, cachedTrack || { id: id, isrc: isrc }, MAX_TRACK_CACHE);
         cacheSet(trackCache, id, Object.assign({}, cachedTrack || { id: id }, { isrc: isrc }), MAX_TRACK_CACHE);
-
-        prewarmPlaybackStream(isrc);
         return isrc;
       }
     } catch (e) {
@@ -106,6 +108,10 @@ function preloadTrackIsrc(trackId) {
   isrcPromises.set(id, promise);
   return promise;
 }
+
+/* -------------------------------------------------------
+ * Deezer Track Transformation
+ * ----------------------------------------------------- */
 
 function transformDeezerTrack(raw) {
   raw = raw || {};
@@ -143,6 +149,10 @@ function transformDeezerTrack(raw) {
   return track;
 }
 
+/* -------------------------------------------------------
+ * Search (Enforces minimum 10 items)
+ * ----------------------------------------------------- */
+
 async function searchTracks(query, limit, context) {
   query = String(query || "").trim().replace(/\s+/g, " ");
   if (!query) return { tracks: [], total: 0 };
@@ -156,19 +166,16 @@ async function searchTracks(query, limit, context) {
   var existingRequest = pendingSearches.get(cacheKey);
   if (existingRequest) return existingRequest;
 
+  // Requests 25 candidates so after filtering, >= 10 results are guaranteed
   var requestUrl =
-    PLAYBACK_ENDPOINT +
+    DEEZER_API_BASE +
     "/search?q=" +
     encodeURIComponent(query) +
-    "&limit=" +
-    Math.max(effectiveLimit, 25);
+    "&limit=25";
 
   var request = (async function () {
     try {
       var response = await fetch(requestUrl);
-      if (!response.ok) {
-        response = await fetch(DEEZER_API_FALLBACK + "/search?q=" + encodeURIComponent(query) + "&limit=25");
-      }
       if (!response.ok) throw new Error("Search HTTP " + response.status);
 
       var body = await response.json();
@@ -200,19 +207,67 @@ async function searchTracks(query, limit, context) {
   return request;
 }
 
-function map8SpineQuality(qualityStr, audioQualityEnum) {
-  if (audioQualityEnum === "HI_RES" || audioQualityEnum === "LOSSLESS" || audioQualityEnum === "HIGH") {
-    return audioQualityEnum;
+/* -------------------------------------------------------
+ * Direct Worker Fetchers
+ * ----------------------------------------------------- */
+
+async function fetchFromQobuz(isrc) {
+  var url = QOBUZ_WORKER + "/?isrc=" + encodeURIComponent(isrc);
+  var res = await fetch(url);
+  if (!res.ok) throw new Error("Qobuz HTTP " + res.status);
+
+  var data = await res.json();
+  if (!data || !data.streamUrl) {
+    throw new Error("No Qobuz streamUrl");
   }
-  var q = String(qualityStr || "").toUpperCase();
-  if (q.includes("24-BIT") || q.includes("HI-RES") || q.includes("HI_RES") || q.includes("96") || q.includes("192")) {
-    return "HI_RES";
-  }
-  if (q.includes("16-BIT") || q.includes("LOSSLESS") || q.includes("FLAC")) {
-    return "LOSSLESS";
-  }
-  return "HIGH";
+
+  // Parse Qobuz bit_depth & sampling_rate
+  var bitDepth = Number(data.bit_depth) || 16;
+  var samplingRate = Number(data.sampling_rate) || 44.1;
+  var isHiRes = bitDepth > 16 || samplingRate > 48;
+
+  return {
+    provider: "qobuz",
+    streamUrl: data.streamUrl, // Direct Akamai CDN link
+    audioQuality: isHiRes ? "HI_RES" : "LOSSLESS",
+    title: data.title,
+    artist: data.artist,
+    album: data.album,
+    duration: data.duration
+  };
 }
+
+async function fetchFromDeezer(isrc) {
+  var url = DEEZER_WORKER + "/?isrc=" + encodeURIComponent(isrc);
+  var res = await fetch(url);
+  if (!res.ok) throw new Error("Deezer HTTP " + res.status);
+
+  var data = await res.json();
+  if (!data || !data.streamUrl) {
+    throw new Error("No Deezer streamUrl");
+  }
+
+  // Deezer returns format: "FLAC", quality: "16-bit / 44.1kHz Lossless"
+  var rawQuality = String(data.quality || data.format || "").toUpperCase();
+  var audioQuality = "LOSSLESS";
+  if (rawQuality.includes("320") || rawQuality.includes("MP3")) {
+    audioQuality = "HIGH";
+  }
+
+  return {
+    provider: "deezer",
+    streamUrl: data.streamUrl, // Direct deezer.alxhlms.workers.dev/stream decryptor link
+    audioQuality: audioQuality,
+    title: data.title,
+    artist: data.artist,
+    album: data.album,
+    duration: data.duration
+  };
+}
+
+/* -------------------------------------------------------
+ * Playback (Races Qobuz & Deezer directly from the client)
+ * ----------------------------------------------------- */
 
 async function getTrackStreamUrl(trackId, quality, context) {
   var inputId = String(trackId || "").trim();
@@ -220,6 +275,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
 
   var isrc = null;
 
+  // 1. Context check
   var contextIsrc =
     (context && typeof context.isrc === "string" && context.isrc.trim()) ||
     (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
@@ -229,15 +285,18 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = contextIsrc;
   }
 
+  // 2. Direct ISRC string check
   if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(inputId)) {
     isrc = inputId;
   }
 
+  // 3. Cache lookup
   var track = trackCache.get(inputId);
   if (!isrc && track && track.isrc) {
     isrc = track.isrc;
   }
 
+  // 4. Resolve from Deezer API if numeric ID
   if (!isrc && /^\d+$/.test(inputId)) {
     var inFlight = isrcPromises.get(inputId);
     if (inFlight) {
@@ -252,43 +311,51 @@ async function getTrackStreamUrl(trackId, quality, context) {
     throw new Error("Could not resolve ISRC for track: " + inputId);
   }
 
-  // Retrieve track quality metadata from worker
-  var workerUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc) + "&json";
-  var res = await fetch(workerUrl);
-
-  if (!res.ok) {
-    throw new Error("Playback worker returned HTTP " + res.status);
+  // RACE: Fire both Qobuz and Deezer concurrently. Whichever answers first wins!
+  var result = null;
+  try {
+    result = await Promise.any([
+      fetchFromQobuz(isrc),
+      fetchFromDeezer(isrc)
+    ]);
+  } catch (err) {
+    var details = err instanceof AggregateError
+      ? err.errors.map(function(e) { return e.message; }).join(" | ")
+      : err.message;
+    throw new Error("Both Qobuz and Deezer failed: " + details);
   }
 
-  var data = await res.json();
-  if (!data || (!data.streamUrl && !data.source)) {
-    throw new Error("Worker did not return a valid stream response");
+  if (!result || !result.streamUrl) {
+    throw new Error("No stream URL available for track: " + inputId);
   }
 
-  var resolvedBadge = map8SpineQuality(data.quality, data.audioQuality);
-
+  // CRITICAL: track.id MUST equal inputId to prevent 8SPINE infinite loading & track mismatches!
   return {
-    streamUrl: PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc),
+    streamUrl: result.streamUrl,
     track: {
       id: inputId,
       isrc: isrc,
-      title: (track && track.title) || (context && context.track && context.track.title) || "",
-      artist: (track && track.artist) || (context && context.track && context.track.artist) || "",
-      album: (track && track.album) || (context && context.track && context.track.album) || "",
-      albumCover: (track && track.albumCover) || (context && context.track && context.track.albumCover) || null,
-      duration: (track && track.duration) || (context && context.track && context.track.duration) || 0,
-      audioQuality: resolvedBadge
+      title: result.title || (track && track.title) || "",
+      artist: result.artist || (track && track.artist) || "",
+      album: result.album || (track && track.album) || "",
+      albumCover: (track && track.albumCover) || null,
+      duration: result.duration || (track && track.duration) || 0,
+      audioQuality: result.audioQuality // 'HI_RES' | 'LOSSLESS' | 'HIGH'
     }
   };
 }
+
+/* -------------------------------------------------------
+ * 8SPINE Module Export
+ * ----------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.3.1",
-  description: "High-Res playback via Deezer and Qobuz",
-  labels: ["FLAC", "LOSSLESS", "HI-RES"],
+  version: "1.4.0",
+  description: "Direct High-Res playback via Qobuz & Deezer",
+  labels: ["FLAC", "LOSSLESS", "GRRR"],
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
