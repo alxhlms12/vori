@@ -11,13 +11,11 @@ var isrcPromises = new Map();
 
 /* -------------------------------------------------------
  * Connection Pre-warmer
- * Wakes Cloudflare Worker & keeps TLS socket alive in pool
  * ----------------------------------------------------- */
 
 function prewarmPlaybackStream(isrc) {
   if (!isrc) return;
   var streamUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc);
-  // Fire-and-forget HEAD request to warm TLS + Cloudflare Worker isolate
   fetch(streamUrl, { method: "HEAD" }).catch(function () {});
 }
 
@@ -110,7 +108,6 @@ function preloadTrackIsrc(trackId, shouldPrewarm) {
         cacheSet(trackCache, isrc, track || { id: id, isrc: isrc }, MAX_TRACK_CACHE);
         cacheSet(trackCache, id, Object.assign({}, track || { id: id }, { isrc: isrc }), MAX_TRACK_CACHE);
 
-        // Pre-warm the playback endpoint concurrently!
         if (shouldPrewarm) {
           prewarmPlaybackStream(isrc);
         }
@@ -119,7 +116,6 @@ function preloadTrackIsrc(trackId, shouldPrewarm) {
       }
     } catch (e) {
     } finally {
-      // Clean up in-flight map after resolution to prevent memory leaks
       isrcPromises.delete(id);
     }
     return null;
@@ -211,12 +207,10 @@ async function searchTracks(query, limit, context) {
         tracks[i] = transformDeezerTrack(sortedRawTracks[i]);
       }
 
-      // Priority Lane: Give Candidate 0 the entire network connection first
       if (tracks.length > 0 && tracks[0].id) {
-        preloadTrackIsrc(tracks[0].id, true); // true = prewarm worker connection
+        preloadTrackIsrc(tracks[0].id, true);
       }
 
-      // Stagger Candidate 1 so it doesn't compete for Candidate 0's mobile socket
       if (tracks.length > 1 && tracks[1].id) {
         setTimeout(function () {
           preloadTrackIsrc(tracks[1].id, false);
@@ -243,23 +237,20 @@ async function getTrackStreamUrl(trackId, quality, context) {
   var id = String(trackId || "").trim();
   if (!id) throw new Error("Valid track ID or ISRC required for playback");
 
-  // 1. FAST PATH: 8SPINE context already has the ISRC (0ms delay)
+  var isrc = null;
+
+  // 1. FAST PATH: Check context
   var contextIsrc =
     (context && typeof context.isrc === "string" && context.isrc.trim()) ||
     (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
     null;
 
   if (contextIsrc) {
-    prewarmPlaybackStream(contextIsrc);
-    return {
-      streamUrl: PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(contextIsrc),
-      track: { id: contextIsrc, isrc: contextIsrc, audioQuality: quality || "HIGH" }
-    };
+    isrc = contextIsrc;
   }
 
   // 2. Direct ISRC check
-  var isrc = null;
-  if (/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id)) {
+  if (!isrc && /^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id)) {
     isrc = id;
   }
 
@@ -269,7 +260,7 @@ async function getTrackStreamUrl(trackId, quality, context) {
     isrc = track.isrc;
   }
 
-  // 4. Resolve ISRC if numeric Deezer ID
+  // 4. Resolve ISRC from Deezer ID if needed
   if (!isrc && /^\d+$/.test(id)) {
     var inFlight = isrcPromises.get(id);
     if (inFlight) {
@@ -280,35 +271,44 @@ async function getTrackStreamUrl(trackId, quality, context) {
     }
   }
 
-  // 5. Strict check: never pass numeric IDs to the worker
   if (!isrc) {
     throw new Error("Could not resolve a valid ISRC for track: " + id);
   }
 
-  return {
-    streamUrl:
-      PLAYBACK_ENDPOINT +
-      "/stream?i=" +
-      encodeURIComponent(isrc),
+  // Fetch JSON stream details from the Worker
+  var workerUrl = PLAYBACK_ENDPOINT + "/stream?i=" + encodeURIComponent(isrc) + "&json";
+  var res = await fetch(workerUrl);
 
+  if (!res.ok) {
+    throw new Error("Playback worker returned HTTP " + res.status);
+  }
+
+  var data = await res.json();
+  if (!data || !data.streamUrl) {
+    throw new Error("Worker did not return a stream URL");
+  }
+
+  return {
+    streamUrl: data.streamUrl,
     track: Object.assign({}, track || { id: isrc, isrc: isrc }, {
       id: isrc,
       isrc: isrc,
-      audioQuality: quality || "HIGH"
+      audioQuality: data.quality || quality || "LOSSLESS"
     })
   };
 }
 
 /* -------------------------------------------------------
- * 8SPINE Module
+ * 8SPINE Module Export
  * ----------------------------------------------------- */
 
 return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.2.6",
-  description: "Currently Identical to the regular build of Vori (stable)",
+  version: "1.2.7",
+  description: "High-Res playback via Deezer and Qobuz",
+  labels: ["FLAC", "LOSSLESS", "HI-RES"], // Crucial for 8SPINE stream resolution
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
