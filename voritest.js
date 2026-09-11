@@ -355,7 +355,7 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.5.2-beta-v2",
+  version: "1.5.2-beta-v3",
   description: "Canonical iTunes Search with ISRC Resolution Layer & Raced Playback",
   labels: ["G", "GR", "GRR"],
 
