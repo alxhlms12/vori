@@ -11,10 +11,6 @@ var pendingSearches = new Map();
 var trackCache = new Map();
 var isrcPromises = new Map();
 
-/* -------------------------------------------------------
- * Bounded Cache Helper
- * ----------------------------------------------------- */
-
 function cacheSet(map, key, value, maxEntries) {
   if (map.has(key)) map.delete(key);
   while (map.size >= maxEntries) {
@@ -25,88 +21,114 @@ function cacheSet(map, key, value, maxEntries) {
 }
 
 /* -------------------------------------------------------
- * ISRC Resolver & Background Preloader
+ * Metadata Cleaning Helper
  * ----------------------------------------------------- */
 
-function getOrResolveIsrc(trackId, context) {
-  var id = String(trackId || "").trim();
-  if (!id) return Promise.resolve(null);
+function cleanMetadata(artist, title) {
+  var cleanTitle = String(title || "")
+    .replace(/[\(\[](feat\.|ft\.|with).*?[\)\]]/gi, "")
+    .replace(/[\(\[](remastered|remaster|deluxe|bonus|version).*?[\)\]]/gi, "")
+    .replace(/-\s*(remastered|single|deluxe|bonus).*$/gi, "")
+    .trim();
 
-  // 1. Check context
-  var contextIsrc =
-    (context && typeof context.isrc === "string" && context.isrc.trim()) ||
-    (context && context.track && typeof context.track.isrc === "string" && context.track.isrc.trim()) ||
-    null;
-  if (contextIsrc) return Promise.resolve(contextIsrc);
+  // Take primary artist if multiple are listed
+  var cleanArtist = String(artist || "")
+    .split(/[,&]/)[0]
+    .replace(/[\(\[].*?[\)\]]/g, "")
+    .trim();
 
-  // 2. Direct ISRC pattern check
-  if (/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(id)) {
-    return Promise.resolve(id);
-  }
+  return { artist: cleanArtist, title: cleanTitle };
+}
 
-  // 3. In-memory cache
-  var track = trackCache.get(id);
-  if (track && track.isrc) {
-    return Promise.resolve(track.isrc);
-  }
+/* -------------------------------------------------------
+ * Layer: iTunes Metadata -> Canonical ISRC Resolution
+ * ----------------------------------------------------- */
 
-  // 4. Check in-flight resolution
-  if (isrcPromises.has(id)) {
-    return isrcPromises.get(id);
-  }
+function resolveIsrcFromMetadata(track) {
+  if (!track || !track.id) return Promise.resolve(null);
+  if (track.isrc) return Promise.resolve(track.isrc);
 
-  // 5. Query Deezer by artist and clean title to fetch the canonical ISRC
+  var id = String(track.id).trim();
+  if (isrcPromises.has(id)) return isrcPromises.get(id);
+
   var promise = (async function () {
+    var cleaned = cleanMetadata(track.artist, track.title);
+    var targetDuration = Number(track.duration) || 0;
+
+    // Strategy 1: Deezer search with Duration Scoring
     try {
-      if (!track) return null;
+      var query = encodeURIComponent(cleaned.artist + " " + cleaned.title);
+      var res = await fetch(DEEZER_API_BASE + "/search?q=" + query + "&limit=10");
+      if (res.ok) {
+        var data = await res.json();
+        var candidates = Array.isArray(data.data) ? data.data : [];
 
-      // Strip feature tags for clean matching
-      var cleanTitle = (track.title || "")
-        .replace(/\s*\(feat\..*?\)/i, "")
-        .replace(/\s*\[feat\..*?\]/i, "")
-        .trim();
+        var bestCandidate = null;
+        var lowestDiff = 999;
 
-      var query = 'artist:"' + (track.artist || "") + '" track:"' + cleanTitle + '"';
-      var res = await fetch(DEEZER_API_BASE + "/search?q=" + encodeURIComponent(query) + "&limit=1");
-      if (!res.ok) {
-        // Fallback to broader search if strict query fails
-        res = await fetch(DEEZER_API_BASE + "/search?q=" + encodeURIComponent(track.artist + " " + cleanTitle) + "&limit=1");
-      }
-      if (!res.ok) return null;
+        for (var i = 0; i < candidates.length; i++) {
+          var cand = candidates[i];
+          var durDiff = Math.abs((Number(cand.duration) || 0) - targetDuration);
 
-      var data = await res.json();
-      if (data && Array.isArray(data.data) && data.data.length > 0) {
-        var deezerId = data.data[0].id;
-        var trackRes = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(deezerId));
-        if (trackRes.ok) {
-          var trackData = await trackRes.json();
-          if (trackData && trackData.isrc) {
-            var isrc = String(trackData.isrc).trim();
-            track.isrc = isrc;
-            cacheSet(trackCache, isrc, track, MAX_TRACK_CACHE);
-            cacheSet(trackCache, id, track, MAX_TRACK_CACHE);
-            return isrc;
+          // Find candidate that matches duration within 4 seconds (eliminates remixes)
+          if (durDiff <= 4 && durDiff < lowestDiff) {
+            lowestDiff = durDiff;
+            bestCandidate = cand;
+          }
+        }
+
+        // If no close duration match, take candidate 0 if available
+        if (!bestCandidate && candidates.length > 0) {
+          bestCandidate = candidates[0];
+        }
+
+        if (bestCandidate && bestCandidate.id) {
+          var trackRes = await fetch(DEEZER_API_BASE + "/track/" + encodeURIComponent(bestCandidate.id));
+          if (trackRes.ok) {
+            var trackData = await trackRes.json();
+            if (trackData && trackData.isrc) {
+              var foundIsrc = String(trackData.isrc).trim();
+              track.isrc = foundIsrc;
+              cacheSet(trackCache, foundIsrc, track, MAX_TRACK_CACHE);
+              cacheSet(trackCache, id, track, MAX_TRACK_CACHE);
+              return foundIsrc;
+            }
           }
         }
       }
-    } catch (e) {
-    } finally {
-      isrcPromises.delete(id);
-    }
+    } catch (e) {}
+
+    // Strategy 2: MusicBrainz Open ISRC Registry Fallback
+    try {
+      var mbQuery = 'recording:"' + cleaned.title + '" AND artist:"' + cleaned.artist + '"';
+      var mbRes = await fetch("https://musicbrainz.org/ws/2/recording?query=" + encodeURIComponent(mbQuery) + "&fmt=json&limit=3");
+      if (mbRes.ok) {
+        var mbData = await mbRes.json();
+        var recordings = Array.isArray(mbData.recordings) ? mbData.recordings : [];
+        for (var j = 0; j < recordings.length; j++) {
+          var rec = recordings[j];
+          if (rec.isrcs && rec.isrcs.length > 0) {
+            var mbIsrc = String(rec.isrcs[0]).trim();
+            track.isrc = mbIsrc;
+            cacheSet(trackCache, mbIsrc, track, MAX_TRACK_CACHE);
+            cacheSet(trackCache, id, track, MAX_TRACK_CACHE);
+            return mbIsrc;
+          }
+        }
+      }
+    } catch (e) {}
+
     return null;
-  })();
+  })().finally(function () {
+    isrcPromises.delete(id);
+  });
 
   isrcPromises.set(id, promise);
   return promise;
 }
 
-function preloadIsrcForTrack(track) {
-  if (!track || !track.id || track.isrc) return;
-  getOrResolveIsrc(track.id, null).catch(function () {});
-}
-
 /* -------------------------------------------------------
- * Search via iTunes API (Best / Top Track First)
+ * Search via iTunes (Top Studio Tracks First)
  * ----------------------------------------------------- */
 
 async function searchTracks(query, limit, context) {
@@ -122,13 +144,13 @@ async function searchTracks(query, limit, context) {
   var existingRequest = pendingSearches.get(cacheKey);
   if (existingRequest) return existingRequest;
 
-  // Direct ISRC search bypass
+  // Direct ISRC query check
   if (/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(query)) {
     var directTrack = {
       id: query,
       isrc: query,
       title: "Track " + query,
-      artist: "Unknown Artist",
+      artist: "Direct ISRC",
       album: "",
       albumCover: null,
       duration: 0,
@@ -178,13 +200,13 @@ async function searchTracks(query, limit, context) {
         tracks.push(track);
       }
 
-      // Fast-Path: Immediately preload candidate 0 so when clicked, ISRC is instant
+      // Preload ISRC for Candidate 0 in the background for instant playback
       if (tracks.length > 0) {
-        preloadIsrcForTrack(tracks[0]);
+        resolveIsrcFromMetadata(tracks[0]);
       }
       if (tracks.length > 1) {
         setTimeout(function () {
-          preloadIsrcForTrack(tracks[1]);
+          resolveIsrcFromMetadata(tracks[1]);
         }, 80);
       }
 
@@ -201,8 +223,8 @@ async function searchTracks(query, limit, context) {
 }
 
 /* -------------------------------------------------------
- * Stream Fetchers (Strict Non-Empty streamUrl Validation)
- * ----------------------------------------------------- */
+ * Qobuz and Deezer Stream Fetchers
+ * ------------------------------------------------------- */
 
 async function fetchFromQobuz(isrc) {
   var url = QOBUZ_WORKER + "/?isrc=" + encodeURIComponent(isrc);
@@ -210,7 +232,6 @@ async function fetchFromQobuz(isrc) {
   if (!res.ok) throw new Error("Qobuz HTTP " + res.status);
 
   var data = await res.json();
-  // Validate that streamUrl exists and is non-empty
   if (!data || !data.streamUrl || typeof data.streamUrl !== "string" || !data.streamUrl.trim()) {
     throw new Error("Qobuz returned no valid streamUrl");
   }
@@ -218,7 +239,7 @@ async function fetchFromQobuz(isrc) {
   return {
     provider: "qobuz",
     streamUrl: data.streamUrl.trim(),
-    audioQuality: "LOSSLESS",
+    audioQuality: "LOSSLESS", // Strictly LOSSLESS for 8SPINE badge
     title: data.title,
     artist: data.artist,
     album: data.album,
@@ -232,7 +253,6 @@ async function fetchFromDeezer(isrc) {
   if (!res.ok) throw new Error("Deezer HTTP " + res.status);
 
   var data = await res.json();
-  // Validate that streamUrl exists and is non-empty
   if (!data || !data.streamUrl || typeof data.streamUrl !== "string" || !data.streamUrl.trim()) {
     throw new Error("Deezer returned no valid streamUrl");
   }
@@ -252,27 +272,57 @@ async function fetchFromDeezer(isrc) {
 }
 
 /* -------------------------------------------------------
- * Playback Method (Concurrent Race with Fallback)
- * ----------------------------------------------------- */
+ * Playback Method (Raced with Strict URL Validation)
+ * ------------------------------------------------------- */
 
 async function getTrackStreamUrl(trackId, quality, context) {
   var inputId = String(trackId || "").trim();
   if (!inputId) throw new Error("Valid track ID required for playback");
 
-  // Resolve ISRC (instant if preloaded)
-  var isrc = await getOrResolveIsrc(inputId, context);
-  if (!isrc) {
-    throw new Error("Could not resolve ISRC for track: " + inputId);
+  var track = trackCache.get(inputId);
+
+  // 1. Resolve ISRC via the resolution layer
+  var isrc = null;
+  if (/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/i.test(inputId)) {
+    isrc = inputId;
+  } else if (track && track.isrc) {
+    isrc = track.isrc;
+  } else if (context && context.isrc) {
+    isrc = context.isrc;
+  } else {
+    isrc = await resolveIsrcFromMetadata(track);
   }
 
-  // Race Qobuz and Deezer concurrently.
-  // Whichever fulfills with a valid streamUrl first wins.
-  // If one fails or returns no streamUrl, it rejects and Promise.any takes the other.
+  if (!isrc) {
+    throw new Error("Could not map track to ISRC for: " + (track ? track.title : inputId));
+  }
+
+  // 2. Strict Valid-Stream Wrappers (Throws if streamUrl is missing/empty)
+  function validQobuz(code) {
+    return fetchFromQobuz(code).then(function (res) {
+      if (!res || !res.streamUrl || !res.streamUrl.startsWith("http")) {
+        throw new Error("Qobuz streamUrl invalid");
+      }
+      return res;
+    });
+  }
+
+  function validDeezer(code) {
+    return fetchFromDeezer(code).then(function (res) {
+      if (!res || !res.streamUrl || !res.streamUrl.startsWith("http")) {
+        throw new Error("Deezer streamUrl invalid");
+      }
+      return res;
+    });
+  }
+
+  // 3. Race Qobuz and Deezer. Whichever produces a valid streamUrl first wins.
+  // If one fails or returns no URL, it rejects and Promise.any automatically takes the other.
   var result = null;
   try {
     result = await Promise.any([
-      fetchFromQobuz(isrc),
-      fetchFromDeezer(isrc)
+      validQobuz(isrc),
+      validDeezer(isrc)
     ]);
   } catch (err) {
     var details = err instanceof AggregateError
@@ -281,19 +331,18 @@ async function getTrackStreamUrl(trackId, quality, context) {
     throw new Error("Both Qobuz and Deezer failed: " + details);
   }
 
-  var track = trackCache.get(inputId);
-
+  // 4. Return to 8SPINE (Matching the official 8SPINE Module Contract)
   return {
     streamUrl: result.streamUrl,
     track: {
-      id: inputId, // Preserves original queue ID to prevent player stalls
+      id: inputId, // Preserves original queue ID
       isrc: isrc,
       title: result.title || (track && track.title) || "",
       artist: result.artist || (track && track.artist) || "",
       album: result.album || (track && track.album) || "",
       albumCover: (track && track.albumCover) || null,
       duration: result.duration || (track && track.duration) || 0,
-      audioQuality: result.audioQuality || "LOSSLESS"
+      audioQuality: result.audioQuality || "LOSSLESS" // Strictly 'LOSSLESS' or 'HIGH' to display the badge
     }
   };
 }
@@ -306,9 +355,9 @@ return {
   id: "vori-test",
   name: "vori-test",
   author: "alxhlms",
-  version: "1.5.2-beta-v1",
-  description: "16 / 44.1 Maximum Quality Playback, Occasional MP3_128 from Deezer Worker from ARL expirations",
-  labels: ["DEEZER", "QOBUZ", "CD-QUALITY"],
+  version: "1.5.2-beta-v2",
+  description: "Canonical iTunes Search with ISRC Resolution Layer & Raced Playback",
+  labels: ["G", "GR", "GRR"],
 
   searchTracks: searchTracks,
   getTrackStreamUrl: getTrackStreamUrl
